@@ -41,7 +41,7 @@ if [[ ! -f "index.npz" ]]; then
     
     if [[ -n "$SFX_DIR" && -d "$SFX_DIR" ]]; then
         echo "⏳ Ses kütüphanesi indexleniyor... (Bu işlem ses sayısına göre vakit alabilir)"
-        python clap_index.py --audio_dir "$SFX_DIR"
+        python src/clap_index.py --audio_dir "$SFX_DIR"
         echo "✅ Ses kütüphanesi hazır!"
         echo ""
     else
@@ -81,7 +81,7 @@ echo "🚀 İşlem başlatılıyor..."
 echo ""
 
 # Ana programı çalıştır
-python local_sound_designer.py
+python src/main.py
 
 echo ""
 echo "╔════════════════════════════════════════════════════════╗"

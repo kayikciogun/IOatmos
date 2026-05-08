@@ -49,7 +49,7 @@ Mac kullanıyorsanız Terminal veya kod bilmenize hiç gerek yok! Sizin için ha
 3. Arkanıza yaslanın! Sistem videoyu sahnelere bölecek, yapay zeka ile izleyecek ve uygun sesleri bulacaktır.
 4. İşlem bitince **`outputs`** klasörü otomatik açılır. İçindeki **`.aaf`** dosyasını doğrudan Logic Pro, Premiere, Pro Tools veya DaVinci Resolve'a sürükleyip atabilirsiniz!
 
-> **Geliştiriciler için:** Terminal üzerinden `bash setup.sh` komutunu veya `python local_sound_designer.py` komutunu kullanarak da sistemi çalıştırabilirsiniz.
+> **Geliştiriciler için:** Terminal üzerinden `bash setup.sh` komutunu veya `python src/main.py` komutunu kullanarak da sistemi çalıştırabilirsiniz.
 
 `outputs/<video_adı>_frames/` klasöründe şunları bulacaksınız:
 

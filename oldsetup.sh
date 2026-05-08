@@ -122,15 +122,15 @@ else
     
     if [[ -n "$SFX_DIR" && -d "$SFX_DIR" ]]; then
         echo -e "${YELLOW}  ⏳ Ses kütüphanesi indexleniyor (bu biraz zaman alabilir)...${NC}"
-        python clap_index.py --audio_dir "$SFX_DIR"
+        python src/clap_index.py --audio_dir "$SFX_DIR"
         echo -e "${GREEN}  ✅ Index oluşturuldu!${NC}"
     elif [[ -n "$SFX_DIR" ]]; then
         echo -e "${RED}  ❌ Klasör bulunamadı: $SFX_DIR${NC}"
         echo -e "  Daha sonra şu komutla indexleyebilirsiniz:"
-        echo -e "  ${BOLD}python clap_index.py --audio_dir /yol/ses/klasörü${NC}"
+        echo -e "  ${BOLD}python src/clap_index.py --audio_dir /yol/ses/klasörü${NC}"
     else
         echo -e "  ⏭️  Atlandı. Daha sonra şu komutla indexleyin:"
-        echo -e "  ${BOLD}python clap_index.py --audio_dir /yol/ses/klasörü${NC}"
+        echo -e "  ${BOLD}python src/clap_index.py --audio_dir /yol/ses/klasörü${NC}"
     fi
 fi
 
@@ -148,7 +148,7 @@ echo -e "  1. Videoyu ${BOLD}inputs/${NC} klasörüne koyun"
 echo -e "  2. Çalıştırın:"
 echo ""
 echo -e "     ${GREEN}source .venv/bin/activate${NC}"
-echo -e "     ${GREEN}python local_sound_designer.py${NC}"
+echo -e "     ${GREEN}python src/main.py${NC}"
 echo ""
 echo -e "  3. Çıktılar ${BOLD}outputs/${NC} klasöründe:"
 echo -e "     📋 Manifest JSON  → sahne-ses eşleştirmesi"

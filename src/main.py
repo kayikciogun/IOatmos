@@ -10,7 +10,7 @@ from datetime import datetime
 import numpy as np
 
 from VtoF.video_analyzer import detect_scenes, save_scene_frames
-from aaf_external import create_external_aaf
+from aaf_exporter import create_external_aaf
 
 def check_dependencies():
     """Gerekli Python kütüphanelerini kontrol eder ve eksikleri kurar."""

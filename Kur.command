@@ -114,7 +114,7 @@ else
         echo "     Klasör: $SFX_DIR"
         echo "     (Dosya sayısına göre 1-10 dakika sürebilir)"
         echo ""
-        python clap_index.py --audio_dir "$SFX_DIR"
+        python src/clap_index.py --audio_dir "$SFX_DIR"
         echo ""
         echo "  ✅ Ses kütüphanesi indexlendi!"
     else

@@ -110,7 +110,7 @@ def filename_to_caption(path: str) -> str:
 
 
 def download_ckpt_if_needed(url: str, name: str) -> str:
-    local_dir = Path(__file__).parent / "models"
+    local_dir = Path(__file__).parent.parent / "models"
     local_dir.mkdir(parents=True, exist_ok=True)
     target = local_dir / name
     
