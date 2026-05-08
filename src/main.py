@@ -604,6 +604,11 @@ def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"
     print(f"   ⏱️  Süre: {pipeline_duration:.1f}sn")
     print(f"{'='*60}")
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", type=str, help="İşlenecek spesifik video yolu")
+    args = parser.parse_args()
+
     print("="*60)
     print(" OTOMATİK SES TASARIMCISI (LLAMA.CPP TABANLI) ".center(60, "="))
     print("="*60)
@@ -620,16 +625,22 @@ if __name__ == "__main__":
     os.makedirs("inputs", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
     
-    # inputs klasöründeki popüler video formatlarını bul
     video_files = []
-    for ext in ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.MP4", "*.MOV"]:
-        video_files.extend(glob.glob(os.path.join("inputs", ext)))
+    if args.video:
+        if os.path.exists(args.video):
+            video_files = [args.video]
+        else:
+            print(f"\n[HATA] Belirtilen video bulunamadı: {args.video}")
+    else:
+        # inputs klasöründeki popüler video formatlarını bul
+        for ext in ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.MP4", "*.MOV"]:
+            video_files.extend(glob.glob(os.path.join("inputs", ext)))
         
     if not video_files:
         print("\n[BİLGİ] 'inputs' klasöründe hiç video bulunamadı!")
         print("Lütfen analiz etmek istediğiniz videoları 'inputs' klasörünün içine kopyalayın ve programı tekrar çalıştırın.")
     else:
-        print(f"\n[BİLGİ] 'inputs' klasöründe {len(video_files)} adet video bulundu. Sırayla işleniyor...")
+        print(f"\n[BİLGİ] İşlenecek video sayısı: {len(video_files)}")
         for video_path in video_files:
             print(f"\n{'='*50}")
             print(f" YENİ VİDEO İŞLENİYOR: {os.path.basename(video_path)} ")

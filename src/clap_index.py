@@ -22,6 +22,7 @@ import argparse
 import glob
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -35,6 +36,9 @@ torch.load = _patched_load
 
 import laion_clap
 import numpy as np
+import soundfile as sf
+import librosa
+from torch.utils.data import Dataset, DataLoader
 
 
 AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aiff", ".aif")
@@ -88,12 +92,31 @@ def find_audio_files(audio_dir: str) -> list[str]:
     return sorted(set(os.path.abspath(f) for f in files))
 
 
+def get_audio_duration(file_path):
+    """Ses dosyasının süresini saniye cinsinden döndürür. Önce soundfile, sonra FFprobe kullanır."""
+    try:
+        info = sf.info(file_path)
+        return info.frames / info.samplerate
+    except Exception:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                capture_output=True, text=True, timeout=5
+            )
+            return float(result.stdout.strip())
+        except Exception:
+            return None
+
+
 def filename_to_caption(path: str) -> str:
     """
     'sfx/weather/thunder - heavy rain - weather 1.mp3' → 'thunder heavy rain weather'
 
     - Extension'ı at
     - '-', '_', '.' ayırıcılarını boşluğa çevir
+    - camelCase ayır
+    - Kütüphane prefix'lerini (3DS02, QP92 vb.) temizle
     - Sayıları/duplicate boşlukları temizle
     - Lowercase
     """
@@ -102,6 +125,10 @@ def filename_to_caption(path: str) -> str:
     name = re.sub(r"[-_.]+", " ", name)
     # camelCase → boş ayır (CarEngine → Car Engine)
     name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+    
+    # Kütüphane kodlarını temizle (İçinde hem harf hem rakam olan 3-7 karakterli kelimeler: 3DS02, QP92 vb.)
+    name = re.sub(r"\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{3,7}\b", " ", name)
+    
     # Sayıları çıkar (genelde sadece varyant numarası: "rain 1", "rain 2")
     name = re.sub(r"\b\d+\b", "", name)
     # Çoklu boşlukları sıkıştır
@@ -175,11 +202,35 @@ def build_model(preset_name: str, device_override: str = None):
     return model
 
 
+class AudioDataset(Dataset):
+    def __init__(self, file_paths, max_duration=120.0):
+        self.file_paths = file_paths
+        self.max_duration = max_duration
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        path = self.file_paths[idx]
+        try:
+            # laion_clap expects 48kHz mono. To prevent extreme loading times
+            # and OOMs, cap at max_duration.
+            w, _ = librosa.load(path, sr=48000, duration=self.max_duration)
+            return path, w
+        except Exception:
+            return path, None
+
+def collate_fn(batch):
+    paths = [item[0] for item in batch]
+    waveforms = [item[1] for item in batch]
+    return paths, waveforms
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_dir", required=True)
     parser.add_argument("--index_path", default="./index.npz")
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--preset", default="natural", choices=list(PRESETS.keys()))
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -199,13 +250,26 @@ def main():
         default=32,
         help="Filename text encoding batch boyutu",
     )
+    parser.add_argument(
+        "--min_duration",
+        type=float,
+        default=30.0,
+        help="Minimum ses süresi (saniye). Bu süreden kısa sesler atlanır.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Ses okuma paralelleştirme işlemci sayısı",
+    )
     args = parser.parse_args()
 
     audio_files = find_audio_files(args.audio_dir)
     if not audio_files:
         print(f"❌ {args.audio_dir} içinde ses dosyası yok.")
         return
-    print(f"📁 {len(audio_files)} dosya: {args.audio_dir}\n")
+    
+    print(f"📁 Bulunan dosya: {len(audio_files)}\n")
 
     existing_audio, existing_text, prev_preset, _ = {}, {}, None, None
     if args.update and not args.force:
@@ -215,10 +279,41 @@ def main():
             return
         if existing_audio:
             print(f"♻️  Var olan: {len(existing_audio)} dosya")
+            
+        audio_files = [f for f in audio_files if f not in existing_audio]
+        if not audio_files:
+            print("✅ Yeni dosya yok, yapılacak iş yok.")
+            return
+        print(f"🆕 Süre kontrolü yapılacak yeni dosya: {len(audio_files)}")
 
-    to_embed = [f for f in audio_files if f not in existing_audio]
+    # === Filtreleme (Minimum Süre) ===
+    if args.min_duration > 0:
+        from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"🔍 {args.min_duration} saniyeden kısa sesler ayıklanıyor...")
+        
+        filtered = []
+        skipped_count = 0
+        
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(tqdm(
+                ex.map(lambda f: (f, get_audio_duration(f)), audio_files),
+                total=len(audio_files), desc="Süre kontrolü"
+            ))
+            
+        for f, d in results:
+            if d is not None and d >= args.min_duration:
+                filtered.append(f)
+            else:
+                skipped_count += 1
+                
+        audio_files = filtered
+        if skipped_count > 0:
+            print(f"   ⚠️  {skipped_count} dosya {args.min_duration}sn'den kısa olduğu için atlandı.")
+
+    to_embed = audio_files
     if not to_embed:
-        print("✅ Yapılacak iş yok.")
+        print("❌ Filtreleme sonrası işlenecek dosya kalmadı.")
         return
     print(f"⏳ Embed edilecek: {len(to_embed)} dosya\n")
 
@@ -242,23 +337,53 @@ def main():
     # === Audio embedding ===
     t0 = time.time()
     failed = []
-    for i in range(0, len(to_embed), args.batch_size):
-        batch = to_embed[i : i + args.batch_size]
+    
+    dataset = AudioDataset(to_embed)
+    loader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        num_workers=args.num_workers, 
+        collate_fn=collate_fn, 
+        shuffle=False,
+        prefetch_factor=2 if args.num_workers > 0 else None
+    )
+
+    from tqdm import tqdm
+    pbar = tqdm(
+        total=len(to_embed), 
+        desc="Audio Embed", 
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]", 
+        unit="dosya"
+    )
+
+    for paths, waveforms in loader:
+        valid_paths = []
+        valid_waves = []
+        for p, w in zip(paths, waveforms):
+            if w is not None:
+                valid_paths.append(p)
+                valid_waves.append(w)
+            else:
+                failed.append(p)
+                
+        if not valid_paths:
+            pbar.update(len(paths))
+            continue
+            
         try:
-            emb = model.get_audio_embedding_from_filelist(x=batch, use_tensor=False)
+            emb = model.get_audio_embedding_from_data(x=valid_waves, use_tensor=False)
             emb = emb / np.linalg.norm(emb, axis=1, keepdims=True)
-            for p, e in zip(batch, emb):
+            for p, e in zip(valid_paths, emb):
                 all_paths.append(p)
                 all_audio.append(e)
         except Exception as e:
-            print(f"  ⚠️  Atlandı ({Path(batch[0]).name}...): {type(e).__name__}: {e}")
-            failed.extend(batch)
-            continue
-        done = i + len(batch)
-        elapsed = time.time() - t0
-        rate = done / elapsed if elapsed > 0 else 0
-        eta = (len(to_embed) - done) / rate if rate > 0 else 0
-        print(f"  audio [{done}/{len(to_embed)}] {rate:.1f}/sn, ETA {eta:.0f}sn")
+            tqdm.write(f"  ⚠️  Atlandı ({Path(valid_paths[0]).name}...): {type(e).__name__}: {e}")
+            failed.extend(valid_paths)
+            
+        pbar.update(len(paths))
+    
+    pbar.close()
+        
     print(f"  Audio embed süresi: {time.time()-t0:.1f}sn")
 
     # === Filename text embedding ===
