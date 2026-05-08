@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+models/
+outputs/
+inputs/
+index.npz
+llama.cpp/
+sfx/
