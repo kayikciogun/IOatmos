@@ -1,26 +1,6 @@
-import cv2
 import os
 import subprocess
 import sys
-import time
-import json
-import random
-import re
-import torch
-from datetime import datetime
-from pathlib import Path
-
-import numpy as np
-
-from VtoF.video_analyzer import detect_scenes, save_scene_frames
-from aaf_exporter import create_external_aaf
-from vlm_processor import (
-    start_llama_server, query_llama_server, stop_llama_server,
-    analyze_with_llamacpp_cli, SIMPLE_DESIGNER_PROMPT
-)
-from clap_search import smart_search, load_index as load_clap_index
-
-# --- UCS Modülü Entegrasyonu kaldırıldı (Gerekirse geri eklenebilir) ---
 
 def check_dependencies():
     """Gerekli Python kütüphanelerini kontrol eder ve eksikleri kurar."""
@@ -29,7 +9,9 @@ def check_dependencies():
         "laion_clap": "laion-clap",
         "numpy": "numpy",
         "cv2": "opencv-python",
-        "ffprobe": "ffprobe" # ffprobe sistemde olmalı ama pip'te değil, bunu kontrol edeceğiz
+        "ffprobe": "ffprobe",
+        "dotenv": "python-dotenv",
+        "aiohttp": "aiohttp"
     }
     
     for module, package in required.items():
@@ -46,6 +28,31 @@ def check_dependencies():
 
 # Program başlar başlamaz kütüphaneleri kontrol et
 check_dependencies()
+
+import cv2
+import time
+import json
+import random
+import re
+import torch
+from datetime import datetime
+from pathlib import Path
+import numpy as np
+
+from VtoF.video_analyzer import detect_scenes, save_scene_frames
+from aaf_exporter import create_external_aaf
+from vlm_processor import (
+    start_llama_server, query_llama_server, stop_llama_server,
+    analyze_with_llamacpp_cli, analyze_scenes_batch, SIMPLE_DESIGNER_PROMPT
+)
+from clap_search import smart_search, load_index as load_clap_index
+
+# .env dosyasını yükle
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 def run_cmd(cmd, cwd=None):
     """Verilen terminal komutunu çalıştırır ve hataları yakalar."""
@@ -408,7 +415,7 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
 
 
 
-def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"):
+def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index_path="./index.npz"):
     """Videonun sahnelerini tespit edip, analiz edip, CLAP ile ses eşleştirip manifest oluşturur."""
     pipeline_start = time.time()
     
@@ -450,79 +457,35 @@ def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"
 
     print("\n---> Adım 6: Sahneler için sinematik ses tasarımı yapılıyor (Faz 1)...")
 
-    # Server modunu dene — model 1 kere yüklenecek
-    server_proc = start_llama_server(base_model, mmproj)
-    use_server = server_proc is not None
+    # === Adım 6: Sahne Analizi (Batch/Online veya Sequential/Local) ===
+    # Tüm kare yollarını ve meta verileri topla
+    scene_items = []
+    for scene in scenes:
+        scene_id = scene["scene_id"]
+        frame_path = os.path.join(frame_dir, f"scene_{scene_id:02d}.jpg")
+        blank_info = scene.get("blank_info", {}) or {}
+        
+        scene_items.append({
+            "scene_id": scene_id,
+            "frame_path": frame_path,
+            "start_timecode": scene.get("start"),
+            "end_timecode": scene.get("end"),
+            "duration_seconds": scene.get("duration"),
+            "blank_info": blank_info,
+            "temporal_evolution": "static"
+        })
 
-    if use_server:
-        print(f"   🚀 Server modu aktif — {len(scenes)} sahne SERİ işlenecek (top-3 simple CLAP)...")
+    # Lokal mod ise server'ı başlat
+    server_proc = None
+    if vlm_mode == "local":
+        server_proc = start_llama_server(base_model, mmproj)
 
-        for scene in scenes:
-            scene_id = scene["scene_id"]
-            mid_path = os.path.join(frame_dir, f"scene_{scene_id:02d}.jpg")
-
-            if not os.path.exists(mid_path):
-                print(f"   ⚠️  Kare bulunamadı: {mid_path}")
-                continue
-
-            try:
-                parsed = query_llama_server(mid_path)
-                parsed["temporal_evolution"] = "static"
-                blank_info = scene.get("blank_info", {}) or {}
-                if blank_info.get("is_blank"):
-                    parsed["silence_required"] = True
-
-                # VLM'den gelen veriyi kullan (category ve sound_description zaten içinde)
-                analysis_results.append({
-                    "scene_id": scene_id,
-                    "start_timecode": scene.get("start"),
-                    "end_timecode": scene.get("end"),
-                    "duration_seconds": scene.get("duration"),
-                    "frame_path": mid_path,
-                    "blank_info": blank_info,
-                    **parsed
-                })
-                desc = parsed.get("sound_description", "")
-                neg = parsed.get("negative_description", "")
-                sil = "🔇 SESSIZ" if parsed.get("silence_required") else ""
-                neg_str = f" | ❌ Neg: {neg}" if neg else ""
-                print(f"   ✅ Sahne {scene_id:02d} | ✅ Pos: {desc}{neg_str} {sil}")
-            except Exception as e:
-                print(f"   ❌ Sahne {scene_id} hatası: {e}")
-
-    else:
-        print(f"   📟 CLI modu — her sahne için model yeniden yüklenecek (Yavaş)")
-        for scene in scenes:
-            scene_id = scene["scene_id"]
-            frame_path = os.path.join(frame_dir, f"scene_{scene_id:02d}.jpg")
-
-            if not os.path.exists(frame_path):
-                print(f"   ⚠️  Kare bulunamadı: {frame_path}")
-                continue
-
-            try:
-                parsed = analyze_with_llamacpp_cli(frame_path, base_model, mmproj)
-                # VLM'den gelen veriyi kullan (category ve sound_description zaten içinde)
-                blank_info = scene.get("blank_info", {}) or {}
-
-                res_item = {
-                    "scene_id": scene_id,
-                    "start_timecode": scene.get("start"),
-                    "end_timecode": scene.get("end"),
-                    "duration_seconds": scene.get("duration"),
-                    "frame_path": frame_path,
-                    "blank_info": blank_info,
-                    "temporal_evolution": "static",
-                    "silence_required": blank_info.get("is_blank", False),
-                    **parsed
-                }
-                analysis_results.append(res_item)
-                print(f"   ✅ Sahne {scene_id:02d} | {parsed.get('sound_description', '')[:60]}...")
-            except Exception as e:
-                print(f"   ❌ Sahne {scene_id} hatası: {e}")
+    print(f"\n---> Adım 6: {len(scene_items)} sahne analiz ediliyor (Mod: {vlm_mode.upper()})...")
+    analysis_results = analyze_scenes_batch(scene_items, mode=vlm_mode, max_workers=8)
 
     # Server'ı kapat
-    stop_llama_server(server_proc)
+    if server_proc:
+        stop_llama_server(server_proc)
 
     # JSON çıktı (jsonlar klasörüne)
     output_json = os.path.join(json_dir, f"{video_basename}_sound_analysis.json")
@@ -598,6 +561,12 @@ if __name__ == "__main__":
     # 3. Modelleri tespit et (indirme yok, sadece mevcutları bul)
     os.makedirs("models", exist_ok=True)
     model_candidates = detect_available_models()
+    
+    # 4. VLM Analiz Modu (Default: Online)
+    vlm_mode = "online"
+        
+    # Mevcut video seçim mantığına vlm_mode bilgisini de ekle
+    # process_video fonksiyonunu güncelleyip vlm_mode parametresini ekleyeceğiz
     if not model_candidates:
         print("\n❌ Hiç VLM modeli bulunamadı!")
         print("   Lütfen models/ klasörüne GGUF + mmproj çifti yerleştirin.")
@@ -663,4 +632,4 @@ if __name__ == "__main__":
                     print("   ❌ Model seçimi iptal edildi.")
                     continue
             
-            extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz")
+            extract_and_analyze(video_path, base_model, mmproj, vlm_mode=vlm_mode, index_path="./index.npz")

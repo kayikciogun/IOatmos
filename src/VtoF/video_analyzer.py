@@ -133,24 +133,13 @@ def analyze_video_content_advanced(video_path, sample_frames=30):
     return recommended_threshold
 
 
-def detect_blank_scenes(video_path, scenes, black_threshold=25, white_threshold=225, sample_points=7):
+def detect_blank_scenes(video_path, scenes, black_threshold=25, white_threshold=225, sample_points=5):
     """
     Boş (tamamen siyah veya beyaz) sahneleri tespit eder ve işaretler.
-    Fade to black/white gibi geçişleri yakalamak için.
-    
-    Args:
-        video_path: Video dosya yolu
-        scenes: Sahne listesi
-        black_threshold: Siyah için maksimum pixel değeri (0-255)
-        white_threshold: Beyaz için minimum pixel değeri (0-255)
-        sample_points: Her sahneden kaç nokta kontrol edilecek (default: 5)
-        
-    Returns:
-        Her sahne için blank durumu içeren dict
+    Hız için kareler 256px'e küçültülerek analiz edilir.
     """
     cap = None
     try:
-        # FFmpeg stderr sustur
         with SuppressFFmpegOutput():
             cap = cv2.VideoCapture(video_path)
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -163,66 +152,70 @@ def detect_blank_scenes(video_path, scenes, black_threshold=25, white_threshold=
                 end_time = timecode_to_seconds(scene['end'])
                 duration = end_time - start_time
                 
-                # Her sahneden birden fazla nokta kontrol et
-                # Başlangıç, çeyrek noktaları, orta, üç çeyrek ve bitiş
+                # Örnekleme noktalarını hesapla
                 sample_times = []
                 if duration < 0.5:
-                    # Çok kısa sahneler için sadece ortayı al
                     sample_times = [(start_time + end_time) / 2]
                 else:
-                    # Normal sahneler için eşit aralıklı noktalar
                     for i in range(sample_points):
                         ratio = i / (sample_points - 1) if sample_points > 1 else 0.5
-                        sample_time = start_time + (duration * ratio)
-                        sample_times.append(sample_time)
+                        sample_times.append(start_time + (duration * ratio))
                 
-                # Her sample noktasında blank kontrolü yap
                 blank_frames = 0
                 black_frames = 0
                 white_frames = 0
                 brightness_values = []
                 
+                # Performans için son hesaplanan değerleri sakla (tekrar kullanma için)
+                edge_density = 0.0
+                lap_var = 0.0
+                color_std = 0.0
+                p_white = 0.0
+                p_black = 0.0
+                uniform_ratio = 0.0
+
                 for sample_time in sample_times:
                     sample_frame_idx = int(sample_time * fps)
-                    
                     cap.set(cv2.CAP_PROP_POS_FRAMES, sample_frame_idx)
                     ret, frame = cap.read()
                     
                     if ret:
-                        # Grayscale'e çevir
+                        # 🚀 OPTİMİZASYON: Analiz için kareyi küçült (256px max)
+                        # Bu, median, mean ve edge detection işlemlerini inanılmaz hızlandırır.
+                        h, w = frame.shape[:2]
+                        target_size = 256
+                        scale = target_size / max(h, w)
+                        if scale < 1.0:
+                            frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
                         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                         mean_brightness = np.mean(gray)
                         std_brightness = np.std(gray)
                         brightness_values.append(mean_brightness)
 
-                        # Renk kanalları üzerinden uniformluk ölçümü (tam renk boş sahneler için)
-                        # BGR kanallarının standart sapması çok düşükse sahne tek renk olabilir
-                        channel_std = np.std(frame, axis=(0, 1))  # B, G, R
+                        # Renk kanalları üzerinden uniformluk
+                        channel_std = np.std(frame, axis=(0, 1))
                         color_std = float(np.mean(channel_std))
 
-                        # Kenar yoğunluğu (çok düşükse büyük olasılıkla boş/tek renk)
+                        # Kenar yoğunluğu ve Laplacian
                         edges = cv2.Canny(gray, 50, 150)
                         edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-                        # Doku/kenar varyansı (Laplacian)
                         lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-                        # Histogram tabanlı oranlar (daha sağlam blank tespiti)
+                        # Histogram ve uniformluk
                         p_black = float(np.mean(gray < black_threshold))
                         p_white = float(np.mean(gray > white_threshold))
+                        
+                        # np.median ağır bir işlemdir, küçük karede bile dikkatli kullanılmalı
                         median_val = float(np.median(gray))
-                        # Daha konservatif uniformluk: ±4 gri seviye ve yüksek oran
                         uniform_ratio = float(np.mean(np.abs(gray.astype(np.float32) - median_val) < 4.0))
                         
-                        # Boş frame tespiti
-                        # Siyah/Beyaz için daha sıkı koşullar
                         is_black = (p_black > 0.98) or (
                             (mean_brightness < black_threshold) and (std_brightness < 10 and edge_density < 0.005)
                         )
                         is_white = (p_white > 0.98) or (
                             (mean_brightness > white_threshold) and (std_brightness < 10 and edge_density < 0.005)
                         )
-                        # Tam renk (ne siyah ne beyaz), ancak çok uniform (düşük varyans)
-                        # Renkli blank için daha sıkı: tüm koşullar bir arada
                         is_color_blank = (not (is_black or is_white)) and (
                             (uniform_ratio > 0.97) and 
                             (color_std < 10.0) and 
@@ -233,9 +226,7 @@ def detect_blank_scenes(video_path, scenes, black_threshold=25, white_threshold=
                         if is_black:
                             black_frames += 1
                             blank_frames += 1
-                        
-                        # Beyaz veya renkli boş frame tespiti
-                        if is_white:
+                        elif is_white:
                             white_frames += 1
                             blank_frames += 1
                         elif is_color_blank:
