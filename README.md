@@ -64,6 +64,10 @@ IOatmos, Apple Silicon (M-Serisi) çiplerin gücünü sonuna kadar kullanmak üz
 - **Akıllı Temizlik:** Dosya isimlerindeki anlamsız kütüphane kodlarını (`3DS02`, `QP92` vb.) otomatik temizler, sadece anlamlı kelimeleri (Caption) kullanarak daha doğru eşleşme yapar.
 - **MPS (GPU) Desteği:** Tüm yapay zeka analizleri Apple GPU (Metal Performance Shaders) üzerinde koşar.
 - **Güvenli Okuma:** Çok uzun ses dosyalarında bile donma/çökme yaşanmaması için 120 saniyelik akıllı okuma limiti mevcuttur.
+- **Dinamik Ağırlıklandırma (Dynamic Weight):** Her ses dosyasının caption kalitesine göre otomatik text/audio ağırlığı belirler. Kısa caption'lar audio-dominant (tw=0.35), zengin caption'lar text-dominant (tw=0.55).
+- **UCS Kategori Sınıflandırma:** CLAP zero-shot ile ses dosyalarını otomatik UCS CatID'lerine (WATR-WATERFALL, AMB-Forest, vb.) ayırır. Su kategorilerinde minimum text weight garantisi (0.50) ile yanlış eşleşmeleri önler.
+- **Caption Zenginleştirme:** Dosya adlarından akustik perspektiv (underwater, interior, distant) ve kategori bazlı context üreterek CLAP eşleşme doğruluğunu artırır.
+- **Negatif Sorgu Desteği:** `--negative` ile istenmeyen ses karakterlerini (örn. "underwater") sonuçlardan çıkarabilirsiniz.
 
 ---
 
@@ -73,16 +77,24 @@ IOatmos, Apple Silicon (M-Serisi) çiplerin gücünü sonuna kadar kullanmak üz
 IOatmos/
 ├── IOatmos.command           # 🚀 ANA MENÜ — Her şeyi buradan yapın
 ├── src/
-│   ├── main.py               # 🎯 Ana pipeline
-│   ├── clap_index.py         # Ses kütüphanesini CLAP ile indexle (Hızlandırılmış)
-│   ├── aaf_exporter.py       # AAF dosyası oluşturucu
-│   └── ...
-├── VtoF/                     # Video-to-Frames modülü
+│   ├── main.py               # 🎯 Ana pipeline — video'dan AAF'a
+│   ├── clap_index.py         # 🎵 Ses kütüphanesini CLAP ile indexle (zero-shot UCS classification)
+│   ├── clap_search.py        # 🔍 Hibrit arama (audio + text similarity, dynamic weight)
+│   ├── caption_enrichment.py # 📝 Dosya adından zenginleştirilmiş caption üret
+│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (online/local)
+│   ├── aaf_exporter.py       # 🎛️ AAF dosyası oluşturucu (Logic/Pro Tools/DaVinci)
+│   ├── update_caption_lengths.py  # 📏 Mevcut index'e caption uzunluğu ekle (bir kez çalıştır)
+│   └── VtoF/
+│       └── video_analyzer.py # 🎬 Sahne tespiti ve kare çıkarma
 ├── inputs/                   # 📥 Videolarınızı buraya koyun
-├── outputs/                  # 📤 Tüm çıktılar burada
-├── models/                   # VLM model dosyaları
-├── llama.cpp/                # Inference motoru
-└── index.npz                 # CLAP ses index dosyası
+├── outputs/                  # 📤 Tüm çıktılar (AAF, manifest, frame'ler)
+├── models/                   # 🤖 VLM model dosyaları (GGUF + mmproj)
+├── llama.cpp/                # ⚡ Inference motoru (llama-server)
+├── sfx/                      # 🎶 Ses efekt kütüphaneniz
+├── Docs/                     # 📖 Dokümantasyon
+├── requirements.txt          # 📦 Python bağımlılıkları
+├── index.npz                 # 💾 CLAP ses index dosyası (otomatik oluşur)
+└── README.md                 # 📘 Bu dosya
 ```
 
 ---
@@ -116,42 +128,16 @@ M1 MacBook'ta: ~30sn (10 sahneli video). Model yükleme bir kere yapılır, sonr
 MP4, MOV, AVI, MKV.
 
 **S: Ses kütüphanem hangi formatta olmalı?**
-WAV, MP3, AIFF, FLAC — hepsi desteklenir.
-
----
-
-## 📜 Lisans
-
-Kişisel ve ticari kullanım serbesttir.
-# IOatmos
-)
-- **Uyumluluk**: Logic Pro, Pro Tools, DaVinci Resolve, Nuendo
-
-### Akıllı Offset Sistemi
-Ses dosyalarının başından alınmaz — ilk 10 saniye atlanır (fade-in ve kayıt anonsu koruması). Dosya kısaysa ortadan alınır.
-
----
-
-## ❓ Sık Sorulan Sorular
-
-**S: İnternet gerekli mi?**
-H: Sadece ilk kurulumda (model indirme). Sonrasında tamamen offline çalışır.
-
-**S: Ne kadar sürer?**
-M1 MacBook'ta: ~30sn (10 sahneli video). Model yükleme bir kere yapılır, sonraki sahneler çok hızlı.
-
-**S: Hangi video formatları desteklenir?**
-MP4, MOV, AVI, MKV.
-
-**S: Ses kütüphanem hangi formatta olmalı?**
-WAV, MP3, AIFF, FLAC — hepsi desteklenir.
+WAV, MP3, AIFF, FLAC, OGG, M4A — hepsi desteklenir.
 
 **S: `index.npz` ne zaman yeniden oluşturulmalı?**
-Kütüphanenize yeni dosyalar eklediğinizde `--update` ile güncelleyin.
+Kütüphanenize yeni dosyalar eklediğinizde `--update` ile hızlıca güncelleyin. Caption uzunluklarını index'e eklemek için bir kez `python src/update_caption_lengths.py` çalıştırın.
+
+**S: Dinamik weight nedir?**
+Her ses dosyasının caption uzunluğuna göre otomatik text/audio ağırlığı belirler. Kısa caption'lar (örn. sadece dosya adı) audio-dominant (tw=0.35), zengin caption'lar (Boom/3DS bext metadata) text-dominant (tw=0.55). Bu, dosya başına en iyi skorlama stratejisini uygular.
 
 ---
 
 ## 📜 Lisans
 
 Kişisel ve ticari kullanım serbesttir.
-# IOatmos
