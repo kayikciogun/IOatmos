@@ -5,12 +5,22 @@ import sys
 import time
 import json
 import random
+import re
+import torch
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
 from VtoF.video_analyzer import detect_scenes, save_scene_frames
 from aaf_exporter import create_external_aaf
+from vlm_processor import (
+    start_llama_server, query_llama_server, stop_llama_server,
+    analyze_with_llamacpp_cli, SIMPLE_DESIGNER_PROMPT
+)
+from clap_search import smart_search, load_index as load_clap_index
+
+# --- UCS Modülü Entegrasyonu kaldırıldı (Gerekirse geri eklenebilir) ---
 
 def check_dependencies():
     """Gerekli Python kütüphanelerini kontrol eder ve eksikleri kurar."""
@@ -62,212 +72,169 @@ def setup_llamacpp():
     else:
         print("\n---> Adım 2: llama.cpp zaten derlenmiş. Geçiliyor...")
 
+def _model_rank(base_path: str) -> float:
+    """Bir model dosyasından tahmini parametre sayısı/quality puanı çıkarır.
+    Dosya adından parametre boyutunu (3B, 7B, 9B, 72B vb.) bulur.
+    BF16/Q8_0/Q6_K/Q4_K_M sıralaması ile quant kalitesini düşürür.
+    """
+    name = Path(base_path).name.lower()
+
+    # 1. Parametre boyutunu adından çıkar (ilk bulunan sayı+B)
+    import re
+    param_match = re.search(r'(\d+\.?\d*)\s*[bB]', name)
+    if param_match:
+        params = float(param_match.group(1))
+    else:
+        # Fallback: dosya boyutundan tahmin (BF16 ~2B/param GB)
+        size_gb = Path(base_path).stat().st_size / 1024**3
+        if size_gb > 5:
+            params = 7.0
+        elif size_gb > 2.5:
+            params = 4.0
+        elif size_gb > 1.5:
+            params = 3.0
+        else:
+            params = 1.5
+
+    # 2. Quantization kalitesi skoru (BF16 en iyi, Q4 en kötü)
+    quant_score = 1.0
+    if 'bf16' in name or 'f16' in name:
+        quant_score = 1.0
+    elif 'q8_0' in name:
+        quant_score = 0.9
+    elif 'q6_k' in name:
+        quant_score = 0.85
+    elif 'q5_k' in name:
+        quant_score = 0.8
+    elif 'q4_k' in name or 'q4_k_m' in name:
+        quant_score = 0.75
+    elif 'q4_0' in name:
+        quant_score = 0.7
+    elif 'q3_k' in name:
+        quant_score = 0.65
+    elif 'q2_k' in name:
+        quant_score = 0.5
+
+    # 3. Overall rank = params * quant_score
+    # Örn: 9B Q6_K = 9 * 0.85 = 7.65
+    # Örn: 4B BF16 = 4 * 1.0 = 4.0
+    return params * quant_score
+
+
+def detect_available_models():
+    """models/ klasöründe mevcut GGUF + mmproj çiftlerini tespit eder."""
+    MODELS_DIR = Path("models")
+    candidates = []
+
+    # 1. Alt klasörler
+    for subdir in MODELS_DIR.iterdir():
+        if not subdir.is_dir():
+            continue
+        ggufs = list(subdir.glob("*.gguf"))
+        base_candidates = [f for f in ggufs if "mmproj" not in f.name.lower()]
+        mmproj_candidates = [f for f in ggufs if "mmproj" in f.name.lower()]
+        if base_candidates and mmproj_candidates:
+            base = max(base_candidates, key=lambda p: p.stat().st_size)
+            mmproj = max(mmproj_candidates, key=lambda p: p.stat().st_size)
+            candidates.append({
+                "base": str(base),
+                "mmproj": str(mmproj),
+                "name": subdir.name,
+                "rank": _model_rank(str(base)),
+                "type": "folder"
+            })
+
+    # 2. Root klasör
+    root_ggufs = list(MODELS_DIR.glob("*.gguf"))
+    root_base = [f for f in root_ggufs if "mmproj" not in f.name.lower()]
+    root_mmproj = [f for f in root_ggufs if "mmproj" in f.name.lower()]
+    if root_base and root_mmproj:
+        base = max(root_base, key=lambda p: p.stat().st_size)
+        mmproj = max(root_mmproj, key=lambda p: p.stat().st_size)
+        candidates.append({
+            "base": str(base),
+            "mmproj": str(mmproj),
+            "name": base.stem[:20],
+            "rank": _model_rank(str(base)),
+            "type": "root"
+        })
+
+    # RANK' e göre sırala (yüksek rank = daha iyi model)
+    candidates.sort(key=lambda x: x["rank"], reverse=True)
+    return candidates
+
+
+def select_model_interactive(candidates, auto_select_best=False):
+    """Kullanıcıya mevcut modelleri gösterir ve her işlemde seçim yapar.
+
+    - Tek model varsa otomatik seçilir (sorulmaz).
+    - Birden fazla varsa numaralı menü gösterilir.
+    - auto_select_best=True yapılırsa en yüksek ranklıyı otomatik seçer
+      (otomatik pipeline'lar için).
+    """
+    if not candidates:
+        return None, None
+
+    best = candidates[0]
+
+    print(f"\n{'='*60}")
+    print(" MEVCUT SİNEMA VLM MODELLERİ ".center(60, "="))
+    print(f"{'='*60}")
+    for i, c in enumerate(candidates, 1):
+        marker = " ★ EN YÜKSEK KALİTE" if i == 1 else ""
+        # Parametre ismini dosya adından çıkar
+        param_str = re.search(r'\d+\.?\d*[Bb]', Path(c["base"]).name)
+        param_info = param_str.group(0) if param_str else "?B"
+        # Dosya boyutunu GB olarak hesapla
+        base_size = Path(c["base"]).stat().st_size / (1024**3)
+        print(f"   [{i}] {c['name']:<35} | {param_info} | {base_size:.1f}GB | rank={c['rank']:.1f}{marker}")
+    print(f"{'='*60}")
+
+    # Tek model varsa veya auto_select_best aktifse → otomatik
+    if len(candidates) == 1 or auto_select_best:
+        print(f"\n   📦 Otomatik seçim: {best['name']} (rank={best['rank']:.1f})")
+        return best["base"], best["mmproj"]
+
+    # Çoklu seçim (her video işlemede sor)
+    while True:
+        choice = input(f"   🎬 Hangi model ile devam etmek istiyorsunuz? (1-{len(candidates)}): ").strip()
+        if not choice:
+            print(f"   ⚠️ Boş giriş. En iyi model seçiliyor: {best['name']}")
+            return best["base"], best["mmproj"]
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(candidates):
+                selected = candidates[idx]
+                print(f"   ✅ Seçilen model: {selected['name']}")
+                return selected["base"], selected["mmproj"]
+            else:
+                print(f"   ⚠️ Lütfen 1-{len(candidates)} arası bir sayı girin.")
+        except ValueError:
+            print(f"   ⚠️ Geçersiz giriş. Lütfen bir sayı girin.")
+
+
 def download_models():
-    """Gerekli olan iki modeli (LLM ve Görüntü Adaptörü) otomatik indirir."""
+    """Otomatik indirme yerine önce mevcut modelleri tespit eder."""
     os.makedirs("models", exist_ok=True)
+
+    candidates = detect_available_models()
+    if candidates:
+        return select_model_interactive(candidates, auto_select_best=True)
+
+    # Fallback: Otomatik indir
+    print("\n---> Adım 3: Hiç model bulunamadı. Varsayılan model indiriliyor...")
     base_model_path = "models/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"
     mmproj_path = "models/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"
-    
-    print("\n---> Adım 3: Modeller kontrol ediliyor...")
     if not os.path.exists(base_model_path):
-        print(f"     Ana model indiriliyor (yaklaşık 1.93 GB)...")
-        run_cmd(["curl", "-L", "-o", base_model_path, "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"])
-        
+        run_cmd(["curl", "-L", "-o", base_model_path,
+                 "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf"])
     if not os.path.exists(mmproj_path):
-        print(f"     Görüntü Adaptörü indiriliyor (yaklaşık 1.34 GB)...")
-        run_cmd(["curl", "-L", "-o", mmproj_path, "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"])
-        
+        run_cmd(["curl", "-L", "-o", mmproj_path,
+                 "https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf"])
     return base_model_path, mmproj_path
 
-def analyze_with_llamacpp(image_path, base_model, mmproj):
-    """Kareyi llama.cpp üzerinden analiz eder (CLI fallback)."""
-    prompt = "You are a professional sound designer. Look at this image and describe the ambient sound environment. Reply with ONLY a short filename in this exact format: Location - TimeOfDay - MainSound. Example: Beach - Sunset - Waves - Seagulls. Do NOT write sentences or explanations."
-    
-    if os.path.exists("llama.cpp/build/bin/llama-mtmd-cli"):
-        cli_path = "llama.cpp/build/bin/llama-mtmd-cli"
-    elif os.path.exists("llama.cpp/build/bin/llama-llava-cli"):
-        cli_path = "llama.cpp/build/bin/llama-llava-cli"
-    else:
-        cli_path = "llama.cpp/build/bin/llama-cli"
-    
-    cmd = [
-        f"./{cli_path}",
-        "-m", base_model,
-        "--mmproj", mmproj,
-        "--image", image_path,
-        "-p", prompt,
-        "-n", "30",
-        "-c", "2048",
-        "--temp", "0.1"
-    ]
-    
-    print(f"\n[{os.path.basename(image_path)}] llama.cpp ile analiz ediliyor...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    output = result.stdout
-    if prompt in output:
-        output = output.split(prompt)[-1].strip()
-    return output
 
-
-# ============================================================
-#   LLAMA SERVER — Model 1 kere yükle, tüm sahneleri işle
-# ============================================================
-
-LLAMA_SERVER_PORT = 8787
-LLAMA_SERVER_URL = f"http://127.0.0.1:{LLAMA_SERVER_PORT}"
-SOUND_DESIGNER_PROMPT = "You are a professional sound designer. Look at this image and describe the general atmospheric ambient sound environment. Focus ONLY on broad environments (e.g. Office, Forest, Hangar, City Street, Factory) and continuous background tones (e.g. Room tone, AC hum, distant traffic, wind, distant birds). DO NOT describe short transient events like 'clicking', 'footsteps', or 'paper crunch'. DO NOT describe visual details like 'sunlight'. Reply with ONLY a short filename in this exact format: BroadLocation - TimeOfDay - MainAmbience - BackgroundAmbience. Example 1: Office - Day - Room Tone - AC Hum. Example 2: Forest - Day - Windy - Distant Birds. Do NOT write sentences or explanations."
-
-
-def clean_description(text):
-    """LLM çıktısını temizler: [img-X] tag'leri, tekrarlar, kesik kelimeleri siler."""
-    import re
-    
-    # 1. [img-X] tag'lerini sil
-    text = re.sub(r'\[img-\d+\]', '', text)
-    
-    # 2. "Location" placeholder'ını sil (model prompt'tan kopyalıyor)
-    text = re.sub(r'\bLocation\b', '', text)
-    
-    # 2. Baştaki/sondaki boşluk ve noktalama temizliği
-    text = text.strip().strip('.')
-    
-    # 3. Tekrarlanan description'ı tespit et ve sadece ilkini al
-    # "City - Day - Traffic - Buildings.City - Day - Traffic" gibi durumları yakala
-    parts = re.split(r'[.\n]', text)
-    parts = [p.strip() for p in parts if p.strip()]
-    if len(parts) > 1:
-        # İlk parça en temiz olandır
-        text = parts[0]
-    
-    # 4. Sondaki kesik kelimeyi temizle (son - den sonra 3 harften kısa kalan kısım)
-    # Örn: "Wind - Birds chir" → "Wind - Birds" (kesik)
-    segments = text.split(' - ')
-    if len(segments) > 1:
-        last = segments[-1].strip()
-        # Son segment 3 karakterden kısaysa veya küçük harfle başlıyorsa kesik
-        if len(last) < 3:
-            segments = segments[:-1]
-        text = ' - '.join(segments)
-    
-    # 5. Baştaki/sondaki tire ve boşluk temizliği
-    text = text.strip().strip('-').strip()
-    
-    return text
-
-
-def start_llama_server(base_model, mmproj):
-    """llama-server'ı arka planda başlatır. Model bir kere yüklenir."""
-    import signal
-    
-    server_path = "llama.cpp/build/bin/llama-server"
-    if not os.path.exists(server_path):
-        print("   ⚠️ llama-server bulunamadı, CLI moduna geçiliyor...")
-        return None
-    
-    cmd = [
-        f"./{server_path}",
-        "-m", base_model,
-        "--mmproj", mmproj,
-        "--port", str(LLAMA_SERVER_PORT),
-        "-c", "2048",
-        "-n", "30",
-        "--temp", "0.1",
-        "--log-disable",
-    ]
-    
-    print(f"   ⏳ llama-server başlatılıyor (port {LLAMA_SERVER_PORT})...")
-    
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid
-    )
-    
-    # Server'ın hazır olmasını bekle (health endpoint)
-    import urllib.request
-    import urllib.error
-    
-    max_wait = 120  # saniye (model yükleme uzun sürebilir)
-    for i in range(max_wait):
-        try:
-            req = urllib.request.urlopen(f"{LLAMA_SERVER_URL}/health", timeout=2)
-            data = json.loads(req.read().decode())
-            if data.get("status") == "ok":
-                print(f"   ✅ llama-server hazır ({i+1}sn'de yüklendi)")
-                return proc
-        except (urllib.error.URLError, ConnectionRefusedError, Exception):
-            pass
-        
-        # Process ölmüş mü kontrol et
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode()
-            print(f"   ❌ llama-server başlatılamadı: {stderr[-300:]}")
-            return None
-        
-        time.sleep(1)
-    
-    print("   ❌ llama-server zaman aşımına uğradı")
-    proc.terminate()
-    return None
-
-
-def query_llama_server(image_path):
-    """Çalışan llama-server'a HTTP ile görüntü gönderip analiz sonucunu alır."""
-    import urllib.request
-    import base64
-    
-    # Görüntüyü base64'e çevir
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("utf-8")
-    
-    # OpenAI /v1/chat/completions formatı - Chat/Instruct modelleri için en güvenilir yol
-    payload = json.dumps({
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text", "text": SOUND_DESIGNER_PROMPT}
-                ]
-            }
-        ],
-        "temperature": 0.2,
-        "max_tokens": 30
-    }).encode("utf-8")
-    
-    req = urllib.request.Request(
-        f"{LLAMA_SERVER_URL}/v1/chat/completions",
-        data=payload,
-        headers={"Content-Type": "application/json"}
-    )
-    
-    try:
-        resp = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(resp.read().decode())
-        raw = result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"   ⚠️ Llama-server hatası: {e}")
-        raw = ""
-        
-    return clean_description(raw)
-
-
-def stop_llama_server(proc):
-    """llama-server process'ini durdurur."""
-    if proc is None:
-        return
-    try:
-        import signal
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    print("   🛑 llama-server durduruldu")
-
+# ======= VLM Fonksiyonları vlm_processor.py dosyasına taşındı.
 
 def get_audio_duration(file_path):
     """Ses dosyasının süresini saniye cinsinden döndürür. FFprobe kullanır."""
@@ -282,184 +249,163 @@ def get_audio_duration(file_path):
         return None
 
 
-def search_clap_index(descriptions, index_path="./index.npz", top_k=3, text_weight=0.3):
+def search_clap_index(analysis_results, index_path="./index.npz", top_k=10, text_weight=0.4):
     """
-    Verilen açıklama listesi ile CLAP index'inde arama yapar.
-    Her açıklama için top_k sonuç döndürür.
-    
-    Returns: dict[tag] -> [(path, score), ...]
+    B+C Birleşik Arama Mimarisi kullanarak arama yapar.
     """
-    import torch
-    _original_load = torch.load
-    def _patched_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return _original_load(*args, **kwargs)
-    torch.load = _patched_load
-    
     import laion_clap
     from clap_index import PRESETS, download_ckpt_if_needed
     
-    # Index'i yükle
-    if not os.path.exists(index_path):
-        print(f"❌ CLAP index bulunamadı: {index_path}")
-        print("   Önce 'python clap_index.py --audio_dir <ses_klasörü>' çalıştırın.")
-        return None
+    idx = load_clap_index(index_path)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
     
-    data = np.load(index_path, allow_pickle=True)
-    paths = data["paths"].tolist()
-    audio_emb = data["embeddings"]
-    text_emb_index = data["text_embeddings"] if "text_embeddings" in data.files else None
-    preset_name = str(data["preset"]) if "preset" in data.files else "natural"
-    
-    cfg = PRESETS[preset_name]
-    has_text = text_emb_index is not None
-    
-    print(f"   📦 Index: {len(paths)} ses dosyası, preset={preset_name}")
-    
-    # Text weight ayarla
-    if not has_text and text_weight > 0:
-        text_weight = 0.0
-    audio_w = 1.0 - text_weight
-    
-    # CLAP modelini yükle (text encoder için)
-    if torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-    
-    print(f"   ⏳ CLAP text encoder yükleniyor ({device})...")
-    model = laion_clap.CLAP_Module(
-        enable_fusion=cfg["fusion"], amodel=cfg["amodel"], device=device
-    )
-    if cfg["model_id"] is not None:
-        model.load_ckpt(model_id=cfg["model_id"])
-    else:
-        ckpt = download_ckpt_if_needed(cfg["ckpt_url"], cfg["ckpt_name"])
-        model.load_ckpt(ckpt)
-    print("   ✅ CLAP hazır")
-    
-    # Açıklamaları encode et
-    query_emb = model.get_text_embedding(descriptions, use_tensor=False)
-    query_emb = query_emb / np.linalg.norm(query_emb, axis=1, keepdims=True)
-    
-    # Similarity hesapla
-    sim_audio = query_emb @ audio_emb.T
-    if has_text and text_weight > 0:
-        sim_text = query_emb @ text_emb_index.T
-        sim_combined = audio_w * sim_audio + text_weight * sim_text
-    else:
-        sim_combined = sim_audio
-    
-    # Her açıklama için top_k sonuç
+    # Modeli yükle
+    print(f"⏳ CLAP Text Encoder yükleniyor...")
+    model = laion_clap.CLAP_Module(enable_fusion=True, amodel='HTSAT-tiny', device=device)
+    ckpt = download_ckpt_if_needed(PRESETS["natural"]["ckpt_url"], PRESETS["natural"]["ckpt_name"])
+    model.load_ckpt(ckpt)
+
     results = {}
-    for i, desc in enumerate(descriptions):
-        scores = sim_combined[i]
-        order = np.argsort(-scores)[:top_k]
-        results[desc] = [(paths[j], float(scores[j])) for j in order]
-    
+    for res in analysis_results:
+        pos_desc = res.get('sound_description', '')
+        pos_category = res.get('category', 'AMB-ROOM-TONE')
+        if not pos_desc: continue
+        
+        # smart_search (Aşama A+B+C - Soft Filter)
+        search_res = smart_search(
+            query=pos_desc,        # Zengin natural language query
+            ucs_category=pos_category, # Soft hint
+            idx=idx,
+            model=model,
+            top_k=top_k
+        )
+        
+        # Sonuçları 'path, score' tuple listesine çevir
+        hits = []
+        for r in search_res["results"]:
+            hits.append((r["path"], r["score"]))
+        
+        # Key olarak description kullanıyoruz (manifest'te eşleşmesi için)
+        results[pos_desc] = hits
+        
     return results
 
 
-def build_manifest(video_path, analysis_results, clap_results, out_dir, video_fps, num_alternatives=3):
+def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video_fps):
     """
-    Sahne analizi ve CLAP arama sonuçlarından manifest JSON oluşturur.
-    örnek_manifest.json formatına uygun.
+    Top-3 CLAP eşleştirme manifest'i.
+    scene_top3: {scene_id: [(path, score), ...]}  (max 3 sonuç)
+    Her sahne için en iyi 3 ses dosyası, tek sırada listelenir.
+    silence_required sahnesinde hiçbir ses eklenmez.
     """
+    SKIP_START = 10.0
+
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
-    # Proje adını dosya sistemi uyumlu yap
     project_name = video_basename.replace(" ", "_").replace("(", "_").replace(")", "_")
-    
-    layer_names = ["Ambience", "Support", "Spot FX"]
-    
+
     scenes_manifest = []
     total_matched = 0
-    
+
     for scene_data in analysis_results:
         scene_id = scene_data["scene_id"]
-        desc = scene_data["sound_description"].strip()
-        duration = scene_data["duration_seconds"]
-        start_tc = scene_data["start_timecode"]
-        end_tc = scene_data["end_timecode"]
-        
-        # Frame hesapla
-        start_seconds = sum(float(x) * mult for x, mult in 
-                           zip(start_tc.split(":"), [3600, 60, 1]))
-        end_seconds = sum(float(x) * mult for x, mult in 
-                        zip(end_tc.split(":"), [3600, 60, 1]))
-        start_frame = int(start_seconds * video_fps)
-        end_frame = int(end_seconds * video_fps)
-        
-        # CLAP sonuçlarını al
-        matches = clap_results.get(desc, []) if clap_results else []
-        
+        duration = scene_data.get("duration_seconds") or 0.0
+        start_tc = scene_data.get("start_timecode", "00:00:00.000")
+        end_tc = scene_data.get("end_timecode", "00:00:00.000")
+        silence = scene_data.get("silence_required", False)
+        temporal_evo = scene_data.get("temporal_evolution", "static")
+
+        def _tc_to_sec(tc):
+            try:
+                h, m, s = tc.split(":")
+                return int(h) * 3600 + int(m) * 60 + float(s)
+            except Exception:
+                return 0.0
+
+        start_sec = _tc_to_sec(start_tc)
+        end_sec = _tc_to_sec(end_tc)
+        start_frame = int(start_sec * video_fps)
+        end_frame = int(end_sec * video_fps)
+
+        hits = scene_top3.get(scene_id, [])
         layers = []
-        for track_idx in range(min(num_alternatives, len(matches))):
-            source_file, score = matches[track_idx]
-            
-            # Ses dosyasının süresini al
-            audio_dur = get_audio_duration(source_file)
-            
-            # Ses dosyasının başını atla (fade-in / kayıt anonsu koruması)
-            # İlk 10 saniyeyi geç, dosya kısa ise mümkün olduğunca ortadan al
-            SKIP_START = 10.0  # saniye — başlangıç güvenlik marjı
-            
-            if audio_dur and audio_dur > duration + SKIP_START:
-                # Yeterli alan var: 10sn sonrasından rastgele seç
-                min_start = SKIP_START
-                max_start = audio_dur - duration
-                source_start = round(random.uniform(min_start, max_start), 3)
-            elif audio_dur and audio_dur > duration:
-                # Dosya kısa ama sahne sığıyor: ortadan al
-                max_start = audio_dur - duration
-                source_start = round(max_start / 2, 3)  # ortadan
-            else:
-                source_start = 0.0
-            source_end = round(source_start + duration, 3)
-            
-            layers.append({
-                "track": track_idx + 1,
-                "layer_name": layer_names[track_idx] if track_idx < len(layer_names) else f"Layer {track_idx+1}",
-                "source_file": source_file,
-                "source_start_offset": source_start,
-                "source_end_offset": source_end,
-                "audio_duration": audio_dur if audio_dur else 0.0,
-                "clip_duration": round(duration, 3),
-                "score": round(score, 4),
-                "status": "ok" if audio_dur else "duration_unknown"
-            })
-            total_matched += 1
-        
+
+        if not silence:
+            selected_keys = set()
+            rank = 1
+            for path, score in hits:
+                if rank > 3: break
+                
+                # Çeşitlilik kontrolü: Dosya adındaki versiyon/varyasyon eklerini temizle (örn: -48k_3, _take1)
+                # ve aynı kök isme sahip dosyaları aynı sahne için tekrar ekleme.
+                filename = os.path.basename(path).lower()
+                # Uzantıyı at ve sonlardaki sayısal varyasyonları temizle
+                base_name = os.path.splitext(filename)[0]
+                # Regex: Sonlardaki _1, -2, _v3, -take4, _48k gibi yapıları temizler
+                sim_key = re.sub(r'([-_]v?\d+|_?\d+k|_take\d+)$', '', base_name).strip('-_ ')
+                
+                if sim_key in selected_keys:
+                    continue
+                
+                audio_dur = get_audio_duration(path)
+                if not audio_dur: continue
+                
+                selected_keys.add(sim_key)
+
+                if audio_dur > duration + SKIP_START:
+                    source_start = round(random.uniform(SKIP_START, audio_dur - duration), 3)
+                elif audio_dur > duration:
+                    source_start = round((audio_dur - duration) / 2, 3)
+                else:
+                    source_start = 0.0
+                source_end = round(source_start + duration, 3)
+
+                layers.append({
+                    "track": rank,
+                    "layer_name": f"Match #{rank}",
+                    "layer_type": "top3",
+                    "source_file": path,
+                    "source_start_offset": source_start,
+                    "source_end_offset": source_end,
+                    "audio_duration": audio_dur,
+                    "clip_duration": round(duration, 3),
+                    "score": round(score, 4),
+                    "confidence": "high" if score > 0.25 else "medium" if score > 0.18 else "low",
+                    "status": "ok",
+                })
+                rank += 1
+                total_matched += 1
+
         scenes_manifest.append({
             "scene_id": scene_id,
             "timeline_start": start_tc,
             "timeline_end": end_tc,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
             "duration": round(duration, 3),
-            "sound_description": desc,
-            "layers": layers
+            "category": scene_data.get("category", ""),
+            "sound_description": scene_data.get("sound_description", ""),
+            "silence_required": silence,
+            "layers": layers,
         })
-    
+
     manifest = {
         "project_name": project_name,
         "created_at": datetime.now().strftime("%H%M%S"),
         "video_file": os.path.abspath(video_path),
         "video_fps": video_fps,
-        "num_alternatives": num_alternatives,
+        "pipeline_version": "simple-top3",
         "total_scenes": len(analysis_results),
         "scenes_with_sound": total_matched,
-        "scenes_skipped": len(analysis_results) - len([s for s in scenes_manifest if s["layers"]]),
-        "audio_source_mode": "middle",
-        "scenes": scenes_manifest
+        "silent_scenes": sum(1 for s in scenes_manifest if s["silence_required"]),
+        "scenes": scenes_manifest,
     }
-    
+
     manifest_path = os.path.join(out_dir, f"{video_basename}_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
-    
+
     return manifest_path, manifest
+
+
+
 
 
 def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"):
@@ -473,17 +419,22 @@ def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"
     out_dir = os.path.join("outputs", f"{video_basename}_frames")
     
     os.makedirs(out_dir, exist_ok=True)
-    output_scenes_json = os.path.join(out_dir, "scenes.json")
     
-    # Sahneleri tespit et
-    detect_scenes(video_path, output_path=output_scenes_json, mode="adaptive")
+    # Çıktı klasörlerini hazırla
+    json_dir = os.path.join(out_dir, "jsonlar")
+    frame_dir = os.path.join(out_dir, "sahneler")
+    os.makedirs(json_dir, exist_ok=True)
+    os.makedirs(frame_dir, exist_ok=True)
+
+    # === Adım 5: Sahne Tespiti ===
+    scenes_json = os.path.join(json_dir, "scenes.json")
+    detect_scenes(video_path, output_path=scenes_json, min_scene_length=0.5)
     
-    # Kaydedilen sahneleri oku
-    with open(output_scenes_json, "r", encoding="utf-8") as f:
+    with open(scenes_json, "r") as f:
         scenes = json.load(f)
-        
-    print(f"\n---> Adım 5: Tespit edilen {len(scenes)} sahnenin tam ortalarından kareler çıkartılıyor...")
-    save_scene_frames(video_path, scenes, output_dir=out_dir, max_dim=720, samples=("mid",))
+    
+    # Kareleri çıkar (Sahneler klasörüne)
+    save_scene_frames(video_path, scenes, output_dir=frame_dir, samples=["mid"])
     
     # Video FPS bilgisini al
     video_metadata_path = os.path.join(out_dir, "video_metadata.json")
@@ -496,91 +447,112 @@ def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"
     
     # JSON çıktısı için sonuçları tutacağımız liste
     analysis_results = []
-    
-    print("\n---> Adım 6: Çıkarılan sahneler için Ses Tasarımı yapılıyor...")
-    
+
+    print("\n---> Adım 6: Sahneler için sinematik ses tasarımı yapılıyor (Faz 1)...")
+
     # Server modunu dene — model 1 kere yüklenecek
     server_proc = start_llama_server(base_model, mmproj)
     use_server = server_proc is not None
-    
+
     if use_server:
-        print(f"   🚀 Server modu aktif — model bellekte kalacak")
+        print(f"   🚀 Server modu aktif — {len(scenes)} sahne SERİ işlenecek (top-3 simple CLAP)...")
+
+        for scene in scenes:
+            scene_id = scene["scene_id"]
+            mid_path = os.path.join(frame_dir, f"scene_{scene_id:02d}.jpg")
+
+            if not os.path.exists(mid_path):
+                print(f"   ⚠️  Kare bulunamadı: {mid_path}")
+                continue
+
+            try:
+                parsed = query_llama_server(mid_path)
+                parsed["temporal_evolution"] = "static"
+                blank_info = scene.get("blank_info", {}) or {}
+                if blank_info.get("is_blank"):
+                    parsed["silence_required"] = True
+
+                # VLM'den gelen veriyi kullan (category ve sound_description zaten içinde)
+                analysis_results.append({
+                    "scene_id": scene_id,
+                    "start_timecode": scene.get("start"),
+                    "end_timecode": scene.get("end"),
+                    "duration_seconds": scene.get("duration"),
+                    "frame_path": mid_path,
+                    "blank_info": blank_info,
+                    **parsed
+                })
+                desc = parsed.get("sound_description", "")
+                neg = parsed.get("negative_description", "")
+                sil = "🔇 SESSIZ" if parsed.get("silence_required") else ""
+                neg_str = f" | ❌ Neg: {neg}" if neg else ""
+                print(f"   ✅ Sahne {scene_id:02d} | ✅ Pos: {desc}{neg_str} {sil}")
+            except Exception as e:
+                print(f"   ❌ Sahne {scene_id} hatası: {e}")
+
     else:
-        print(f"   📟 CLI modu — her sahne için model yeniden yüklenecek")
-    
-    for scene in scenes:
-        scene_id = scene["scene_id"]
-        frame_path = os.path.join(out_dir, f"scene_{scene_id:02d}", "mid.jpg")
-        
-        if not os.path.exists(frame_path):
-            print(f"Uyarı: Kare dosyası bulunamadı ({frame_path}). Atlanıyor...")
-            continue
-        
-        try:
-            if use_server:
-                print(f"\n[Sahne {scene_id}] analiz ediliyor (server)...")
-                description = query_llama_server(frame_path)
-            else:
-                description = analyze_with_llamacpp(frame_path, base_model, mmproj)
-            
-            print("-" * 50)
-            print(f"Sahne {scene_id} ({scene['start']} - {scene['end']}) Ses Analizi:\n{description}")
-            print("-" * 50)
-            
-            # JSON verisi için listeye ekle
-            analysis_results.append({
-                "scene_id": scene_id,
-                "start_timecode": scene.get("start"),
-                "end_timecode": scene.get("end"),
-                "duration_seconds": scene.get("duration"),
-                "frame_path": frame_path,
-                "sound_description": description
-            })
-            
-        except Exception as e:
-            print(f"Sahne {scene_id} işlenirken hata oluştu: {e}")
-    
+        print(f"   📟 CLI modu — her sahne için model yeniden yüklenecek (Yavaş)")
+        for scene in scenes:
+            scene_id = scene["scene_id"]
+            frame_path = os.path.join(frame_dir, f"scene_{scene_id:02d}.jpg")
+
+            if not os.path.exists(frame_path):
+                print(f"   ⚠️  Kare bulunamadı: {frame_path}")
+                continue
+
+            try:
+                parsed = analyze_with_llamacpp_cli(frame_path, base_model, mmproj)
+                # VLM'den gelen veriyi kullan (category ve sound_description zaten içinde)
+                blank_info = scene.get("blank_info", {}) or {}
+
+                res_item = {
+                    "scene_id": scene_id,
+                    "start_timecode": scene.get("start"),
+                    "end_timecode": scene.get("end"),
+                    "duration_seconds": scene.get("duration"),
+                    "frame_path": frame_path,
+                    "blank_info": blank_info,
+                    "temporal_evolution": "static",
+                    "silence_required": blank_info.get("is_blank", False),
+                    **parsed
+                }
+                analysis_results.append(res_item)
+                print(f"   ✅ Sahne {scene_id:02d} | {parsed.get('sound_description', '')[:60]}...")
+            except Exception as e:
+                print(f"   ❌ Sahne {scene_id} hatası: {e}")
+
     # Server'ı kapat
     stop_llama_server(server_proc)
-            
-    # Ses analizi JSON olarak dışa aktar
-    output_json = os.path.join(out_dir, f"{video_basename}_sound_analysis.json")
+
+    # JSON çıktı (jsonlar klasörüne)
+    output_json = os.path.join(json_dir, f"{video_basename}_sound_analysis.json")
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(analysis_results, f, ensure_ascii=False, indent=4)
-    
-    # === Adım 7: CLAP ile ses dosyası eşleştirme ve manifest oluşturma ===
-    print(f"\n---> Adım 7: CLAP veritabanında ses dosyaları aranıyor...")
-    
-    if not os.path.exists(index_path):
-        print(f"   ⚠️  CLAP index ({index_path}) bulunamadı. Manifest oluşturulamadı.")
-        print(f"   Önce 'python clap_index.py --audio_dir <ses_klasörü>' çalıştırın.")
-        print(f"   Ses analizi kaydedildi: {output_json}")
-        return
-    
-    # Her sahnenin açıklamasını topla
-    descriptions = [r["sound_description"].strip() for r in analysis_results]
-    
-    if not descriptions:
-        print("   ⚠️  Analiz sonucu boş, CLAP araması yapılamıyor.")
-        return
-    
-    # CLAP araması yap
-    clap_results = search_clap_index(descriptions, index_path=index_path, top_k=3)
-    
-    if clap_results is None:
-        return
-    
-    # Sonuçları göster
+
+    # === Adım 7: Simple Top-3 CLAP eşleştirme ===
+    scene_top3 = {}
+    if analysis_results:
+        try:
+            # Contrastive CLAP Search (10 sonuç çekiyoruz ki çeşitlilik için alternatif kalsın)
+            match_results = search_clap_index(analysis_results, index_path=index_path, top_k=10)
+            
+            # Sonuçları sahne ID'lerine göre haritala
+            for res in analysis_results:
+                sid = res["scene_id"]
+                pos_desc = res.get("sound_description", "")
+                if pos_desc in match_results:
+                    scene_top3[sid] = match_results[pos_desc]
+                else:
+                    scene_top3[sid] = []
+        except Exception as e:
+            print(f"   ⚠️ CLAP arama hatası: {e}")
+
+    # === Manifest oluştur ===
     print(f"\n---> Adım 8: Manifest oluşturuluyor...")
-    for desc, matches in clap_results.items():
-        print(f"\n   🏷️  '{desc}'")
-        for i, (path, score) in enumerate(matches):
-            print(f"      {i+1}. {score:+.4f}  {os.path.basename(path)}")
-    
-    # Manifest oluştur
-    manifest_path, manifest = build_manifest(
-        video_path, analysis_results, clap_results, out_dir, video_fps
+    manifest_path, manifest = build_manifest_top3(
+        video_path, analysis_results, scene_top3, out_dir, video_fps
     )
+
     
     # === Adım 9: AAF dosyası oluştur ===
     print(f"\n---> Adım 9: External-Linked AAF dosyası oluşturuluyor...")
@@ -592,21 +564,27 @@ def extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz"
         print(f"   ⚠️  AAF oluşturulamadı: {e}")
     
     pipeline_duration = time.time() - pipeline_start
-    
+
     print(f"\n{'='*60}")
-    print(f"✅ Tüm işlemler başarıyla tamamlandı!")
+    print(f"✅ Tüm işlemler başarıyla tamamlandı! (IOatmos v2)")
     print(f"   📁 Çıktı klasörü: {out_dir}")
     print(f"   📋 Manifest: {manifest_path}")
     if aaf_path:
         print(f"   🎛️  AAF: {aaf_path}")
     print(f"   🎬 Toplam sahne: {manifest['total_scenes']}")
     print(f"   🔊 Eşleşen ses: {manifest['scenes_with_sound']}")
+    print(f"   🔇 Sessiz sahne: {manifest.get('silent_scenes', 0)}")
     print(f"   ⏱️  Süre: {pipeline_duration:.1f}sn")
     print(f"{'='*60}")
+
+
 if __name__ == "__main__":
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, help="İşlenecek spesifik video yolu")
+    parser.add_argument("--model", type=str, help="Hangi VLM modelini kullan (1, 2, 3...). Belirtilmezse menü sorar.")
+    parser.add_argument("--auto-model", action="store_true", help="Her video öncesi model seçim menüsü göster")
     args = parser.parse_args()
 
     print("="*60)
@@ -617,10 +595,42 @@ if __name__ == "__main__":
     # 1 ve 2. llama.cpp indir & derle
     setup_llamacpp()
     
-    # 3. Modelleri indir
-    base_model, mmproj = download_models()
+    # 3. Modelleri tespit et (indirme yok, sadece mevcutları bul)
+    os.makedirs("models", exist_ok=True)
+    model_candidates = detect_available_models()
+    if not model_candidates:
+        print("\n❌ Hiç VLM modeli bulunamadı!")
+        print("   Lütfen models/ klasörüne GGUF + mmproj çifti yerleştirin.")
+        print("   Örnek: models/qwen3.5/Qwen3.5-9B-Q6_K.gguf")
+        print("          models/qwen3.5/mmproj-Qwen3.5-9B-BF16.gguf")
+        sys.exit(1)
+
+    # CLI'da --model verildiyse otomatik seç
+    base_model, mmproj = None, None
+    if args.model:
+        try:
+            idx = int(args.model) - 1
+            if 0 <= idx < len(model_candidates):
+                base_model = model_candidates[idx]["base"]
+                mmproj = model_candidates[idx]["mmproj"]
+                print(f"\n   ✅ CLI'dan seçilen model: {model_candidates[idx]['name']}")
+            else:
+                print(f"   ⚠️ --model {args.model} geçersiz. Mevcut modeller:")
+                for i, c in enumerate(model_candidates, 1):
+                    print(f"      {i}. {c['name']}")
+                sys.exit(1)
+        except ValueError:
+            # İsim eşleştirmesi dene
+            for c in model_candidates:
+                if args.model.lower() in c["name"].lower():
+                    base_model, mmproj = c["base"], c["mmproj"]
+                    print(f"   ✅ CLI'dan eşleşen model: {c['name']}")
+                    break
+            if not base_model:
+                print(f"   ⚠️ '{args.model}' isimli model bulunamadı.")
+                sys.exit(1)
     
-    # 4. Videoları bul ve analiz et
+    # 4. Videoları bul
     import glob
     os.makedirs("inputs", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
@@ -632,7 +642,6 @@ if __name__ == "__main__":
         else:
             print(f"\n[HATA] Belirtilen video bulunamadı: {args.video}")
     else:
-        # inputs klasöründeki popüler video formatlarını bul
         for ext in ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.MP4", "*.MOV"]:
             video_files.extend(glob.glob(os.path.join("inputs", ext)))
         
@@ -645,4 +654,13 @@ if __name__ == "__main__":
             print(f"\n{'='*50}")
             print(f" YENİ VİDEO İŞLENİYOR: {os.path.basename(video_path)} ")
             print(f"{'='*50}")
+            
+            # --- HER VİDEO ÖNCESİ MODEL SEÇİMİ ---
+            if args.auto_model or not base_model:
+                # Kullanıcıdan (veya ilk seferde) model seçsin
+                base_model, mmproj = select_model_interactive(model_candidates, auto_select_best=False)
+                if not base_model:
+                    print("   ❌ Model seçimi iptal edildi.")
+                    continue
+            
             extract_and_analyze(video_path, base_model, mmproj, index_path="./index.npz")

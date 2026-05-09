@@ -746,9 +746,6 @@ def save_scene_frames(video_path, scenes, output_dir="data/temp/frames", max_dim
                 end_sec = timecode_to_seconds(scene.get("end"))
                 duration = max(0.0, end_sec - start_sec)
 
-                scene_dir = out_path / f"scene_{scene_id:02d}"
-                scene_dir.mkdir(parents=True, exist_ok=True)
-
                 # Örnek zaman noktaları
                 sample_times = []
                 epsilon = 0.01
@@ -761,12 +758,9 @@ def save_scene_frames(video_path, scenes, output_dir="data/temp/frames", max_dim
                     sample_times.append(max(min(end_sec - epsilon, end_sec), start_sec))
 
                 names = []
-                if "start" in samples:
-                    names.append("start")
-                if "mid" in samples:
-                    names.append("mid")
-                if "end" in samples:
-                    names.append("end")
+                if "start" in samples: names.append("start")
+                if "mid" in samples: names.append("mid")
+                if "end" in samples: names.append("end")
 
                 for idx, sample_time in enumerate(sample_times):
                     frame_index = int(round(sample_time * fps))
@@ -777,7 +771,7 @@ def save_scene_frames(video_path, scenes, output_dir="data/temp/frames", max_dim
                     if not ret or frame is None:
                         continue
 
-                    # Boyutlandırma: max_dim'e sığdır
+                    # Boyutlandırma
                     h, w = frame.shape[:2]
                     scale = 1.0
                     if max(h, w) > max_dim:
@@ -787,8 +781,11 @@ def save_scene_frames(video_path, scenes, output_dir="data/temp/frames", max_dim
                         new_h = int(h * scale)
                         frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-                    name = names[idx] if idx < len(names) else f"t{idx}"
-                    out_file = scene_dir / f"{name}.jpg"
+                    # Dosya ismi: Tek örnekse scene_01.jpg, çokluysa scene_01_mid.jpg
+                    suffix = f"_{names[idx]}" if len(samples) > 1 else ""
+                    filename = f"scene_{scene_id:02d}{suffix}.jpg"
+                    out_file = out_path / filename
+                    
                     cv2.imwrite(str(out_file), frame)
                     saved_paths.append(str(out_file))
 

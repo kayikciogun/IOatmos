@@ -1,0 +1,224 @@
+{
+  "AMB-URBAN": {
+    "category": "AMBIENCE",
+    "subcategory": "URBAN",
+    "catid": "AMBUrbn",
+    "desc": "Dense city, traffic, pedestrians, horns"
+  },
+  "AMB-SUBURBAN": {
+    "category": "AMBIENCE",
+    "subcategory": "SUBURBAN",
+    "catid": "AMBSubn",
+    "desc": "Quiet residential street, lawnmowers, birds"
+  },
+  "AMB-TOWN": {
+    "category": "AMBIENCE",
+    "subcategory": "TOWN",
+    "catid": "AMBTown",
+    "desc": "Small town village, light activity"
+  },
+  "AMB-TRAFFIC": {
+    "category": "AMBIENCE",
+    "subcategory": "TRAFFIC",
+    "catid": "AMBTraf",
+    "desc": "Pure traffic, highway, no pedestrians"
+  },
+  "AMB-PARK": {
+    "category": "AMBIENCE",
+    "subcategory": "PARK",
+    "catid": "AMBPark",
+    "desc": "City park, suburban park, light human activity"
+  },
+  "AMB-FOREST": {
+    "category": "AMBIENCE",
+    "subcategory": "FOREST",
+    "catid": "AMBForst",
+    "desc": "Trees, birds, wind in trees"
+  },
+  "AMB-RURAL": {
+    "category": "AMBIENCE",
+    "subcategory": "RURAL",
+    "catid": "AMBRurl",
+    "desc": "Countryside, away from people"
+  },
+  "AMB-ALPINE": {
+    "category": "AMBIENCE",
+    "subcategory": "ALPINE",
+    "catid": "AMBAlpn",
+    "desc": "Mountain ambience"
+  },
+  "AMB-DESERT": {
+    "category": "AMBIENCE",
+    "subcategory": "DESERT",
+    "catid": "AMBDsrt",
+    "desc": "Quiet desert, insects, tumbleweeds"
+  },
+  "AMB-SEASIDE": {
+    "category": "AMBIENCE",
+    "subcategory": "SEASIDE",
+    "catid": "AMBSea",
+    "desc": "Beach with people, oceanside scene"
+  },
+  "AMB-LAKESIDE": {
+    "category": "AMBIENCE",
+    "subcategory": "LAKESIDE",
+    "catid": "AMBLake",
+    "desc": "Lake scenes"
+  },
+  "AMB-TROPICAL": {
+    "category": "AMBIENCE",
+    "subcategory": "TROPICAL",
+    "catid": "AMBTrop",
+    "desc": "Jungle, rainforest"
+  },
+  "AMB-FARM": {
+    "category": "AMBIENCE",
+    "subcategory": "FARM",
+    "catid": "AMBFarm",
+    "desc": "Farm with animals, tractors"
+  },
+  "AMB-OFFICE": {
+    "category": "AMBIENCE",
+    "subcategory": "OFFICE",
+    "catid": "AMBOffc",
+    "desc": "Workplace, typing, phones, people working"
+  },
+  "AMB-RESTAURANT": {
+    "category": "AMBIENCE",
+    "subcategory": "RESTAURANT & BAR",
+    "catid": "AMBRest",
+    "desc": "Restaurants, bars, dining"
+  },
+  "AMB-PUBLIC": {
+    "category": "AMBIENCE",
+    "subcategory": "PUBLIC PLACE",
+    "catid": "AMBPubl",
+    "desc": "Stores, lobbies, malls, museums"
+  },
+  "AMB-MARKET": {
+    "category": "AMBIENCE",
+    "subcategory": "MARKET",
+    "catid": "AMBMrkt",
+    "desc": "Busy market, vendors, crowds"
+  },
+  "AMB-SCHOOL": {
+    "category": "AMBIENCE",
+    "subcategory": "SCHOOL",
+    "catid": "AMBSchl",
+    "desc": "Classroom, hallway, school bells"
+  },
+  "AMB-HOSPITAL": {
+    "category": "AMBIENCE",
+    "subcategory": "HOSPITAL",
+    "catid": "AMBHosp",
+    "desc": "Hospital, surgery, ER"
+  },
+  "AMB-RELIGIOUS": {
+    "category": "AMBIENCE",
+    "subcategory": "RELIGIOUS",
+    "catid": "AMBRlgn",
+    "desc": "Church, temple, services"
+  },
+  "AMB-TRANSPORT": {
+    "category": "AMBIENCE",
+    "subcategory": "TRANSPORTATION",
+    "catid": "AMBTran",
+    "desc": "Train station, airport, bus station"
+  },
+  "AMB-RESIDENTIAL": {
+    "category": "AMBIENCE",
+    "subcategory": "RESIDENTIAL",
+    "catid": "AMBHome",
+    "desc": "Apartment, house with some activity"
+  },
+  "AMB-ROOM-TONE": {
+    "category": "AMBIENCE",
+    "subcategory": "ROOM TONE",
+    "catid": "AMBRoom",
+    "desc": "Empty room, no activity, just air"
+  },
+  "AMB-CONSTRUCTION": {
+    "category": "AMBIENCE",
+    "subcategory": "CONSTRUCTION",
+    "catid": "AMBCnst",
+    "desc": "Jackhammers, cranes, road construction"
+  },
+  "AMB-INDUSTRIAL": {
+    "category": "AMBIENCE",
+    "subcategory": "INDUSTRIAL",
+    "catid": "AMBInd",
+    "desc": "Warehouse, factory, plant"
+  },
+  "AMB-HITECH": {
+    "category": "AMBIENCE",
+    "subcategory": "HITECH",
+    "catid": "AMBTech",
+    "desc": "Data center, control room, lab"
+  },
+  "AMB-UNDERGROUND": {
+    "category": "AMBIENCE",
+    "subcategory": "UNDERGROUND",
+    "catid": "AMBUndr",
+    "desc": "Cave, sewer, bunker, tunnel"
+  },
+  "AMB-UNDERWATER": {
+    "category": "AMBIENCE",
+    "subcategory": "UNDERWATER",
+    "catid": "AMBUndwtr",
+    "desc": "Deep underwater bubbles"
+  },
+  "AMB-NAUTICAL": {
+    "category": "AMBIENCE",
+    "subcategory": "NAUTICAL",
+    "catid": "AMBNaut",
+    "desc": "Ships at sea, shipyard"
+  },
+  "WATR-SURF": {
+    "category": "WATER",
+    "subcategory": "SURF",
+    "catid": "WATRSurf",
+    "desc": "General ocean roar, constant waves"
+  },
+  "WATR-WAVE": {
+    "category": "WATER",
+    "subcategory": "WAVE",
+    "catid": "WATRWave",
+    "desc": "Distinct individual waves"
+  },
+  "WATR-WATERFALL": {
+    "category": "WATER",
+    "subcategory": "WATERFALL",
+    "catid": "WATRFall",
+    "desc": "Waterfalls"
+  },
+  "WATR-FLOW": {
+    "category": "WATER",
+    "subcategory": "FLOW",
+    "catid": "WATRFlow",
+    "desc": "River, creek, stream"
+  },
+  "WATR-UNDERWATER": {
+    "category": "WATER",
+    "subcategory": "UNDERWATER",
+    "catid": "WATRUndwtr",
+    "desc": "Underwater swimming, currents"
+  },
+  "VEH-INTERIOR": {
+    "category": "VEHICLES",
+    "subcategory": "INTERIOR",
+    "catid": "VEHInt",
+    "desc": "Car/truck interior ambience"
+  },
+  "VEH-CAR": {
+    "category": "VEHICLES",
+    "subcategory": "CAR",
+    "catid": "VEHCar",
+    "desc": "Cars (engine, by, idle)"
+  },
+  "CRWD-WALLA": {
+    "category": "CROWDS",
+    "subcategory": "WALLA",
+    "catid": "CRWDWalla",
+    "desc": "Clean crowd murmur, no words"
+  }
+}

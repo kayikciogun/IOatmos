@@ -21,6 +21,7 @@ Kullanım:
 import argparse
 import glob
 import os
+import struct  
 import re
 import subprocess
 import time
@@ -109,31 +110,288 @@ def get_audio_duration(file_path):
             return None
 
 
+# Mevcut kütüphane prefix'leri için UCS anahtar kelime haritası
+UCS_HINTS = {
+    'UWT': 'underwater water aquatic submerged',
+    '3DS': 'ambience interior room tone enclosed indoor',
+    'QP':  'quiet ambience background',
+    'UWA': 'underwater bubbles water',
+    'SND': 'sound effect foley',
+}
+
+# UCS kategori başına bir "anchor text" tanımla (Zero-shot classification için)
+UCS_ANCHORS = {
+    # Su / Deniz
+    'WATRSurf':   'ocean waves crashing on shore above water surface sea waves surf roar',
+    'WATRUndwtr': 'underwater recording submerged hydrophone deep ocean aquatic bubbles swimming',
+    'WATRFall':   'waterfall cascading water falls splashing heavy water',
+    'WATRFlow':   'river stream creek flowing water bubbling brook',
+    'WATRWave':   'individual ocean waves splashing shore water',
+    'AMBSea':     'beach seaside coastal ocean shore people seagulls seaside ambience',
+    'AMBLake':    'lake water gentle lapping shore birds quiet',
+    'AMBNaut':    'ship boat nautical sea docks gulls waves harbour',
+    
+    # Şehir / Dış Mekan
+    'AMBUrbn':    'city urban street traffic pedestrians trams buses horns sirens busy downtown',
+    'AMBSubn':    'suburban residential neighborhood lawnmower birds children playing quiet',
+    'AMBTraf':    'highway traffic cars engines road busy motorway',
+    'AMBTown':    'small town village light traffic church bell activity',
+    'AMBPark':    'city park wind trees children playing fountain outdoor',
+    
+    # Doğa
+    'AMBForst':   'forest woodland birds wind trees leaves rustling wilderness',
+    'AMBDsrt':    'desert wind sand dunes arid landscape dry wind hiss',
+    'AMBRurl':    'rural countryside prairie meadow nature farm',
+    'AMBTrop':    'jungle rainforest tropical insects birds exotic nature',
+    'AMBFarm':    'farm animals tractor rooster nature countryside',
+    'ANIMBird':   'birds chirping singing forest nature wings wildlife',
+    'ANIMInsct':  'insects crickets grasshoppers buzzing summer',
+    
+    # İç Mekan
+    'AMBRoom':    'empty room tone quiet indoor air hum silence ventilation',
+    'AMBHome':    'residential apartment home interior ambience daily life',
+    'AMBOffc':    'office workplace typing voices phones printer activity',
+    'AMBRest':    'restaurant bar cafe dining crowd dishes glasses chatter',
+    'AMBPubl':    'airport mall lobby museum public indoor crowd shopping center supermarket',
+    'AMBMrkt':    'outdoor market vendors crowd busy street market',
+    'AMBTran':    'train station subway airport terminal transportation hub',
+    'AMBSchl':    'school classroom hallway children talking bells',
+    'AMBHosp':    'hospital medical monitor beeps quiet voices surgery clinic',
+    'AMBRlgn':    'monks chanting temple religious scriptures church prayer',
+    
+    # Endüstriyel / Teknik
+    'AMBUndr':    'underground car park parking garage basement enclosed reverb tunnel cave',
+    'AMBInd':     'industrial factory warehouse machinery plant metal workshop',
+    'AMBCnst':    'construction site jackhammer crane machinery outdoor concrete mixer',
+    'AMBTech':    'server room data center fans hum computers electronics',
+    'VEHInt':     'car interior cabin engine hum road noise driving',
+    'VEHCar':     'car engine driving traffic street vehicle auto',
+    'CRWDWalla':  'crowd murmur walla people talking indistinct background chatter',
+    
+    # Foley / Nesne (Yeni)
+    'TOOLWork':   'hand tools impact manual work toolbox metal wood scraping',
+    'WOODChopp':  'chopping wood axe hitting tree timber forest wood work',
+    'METLWork':   'metal workshop clanging grinding tools factory workshop',
+}
+
+# Manuel override listesi (Path bazlı kesin eşleşmeler)
+MANUAL_OVERRIDES = {
+    'underground car park': 'AMBUndr',
+    'underground garage':   'AMBUndr',
+    'underground lab':      'AMBUndr',
+    'car park':             'AMBUndr',
+    'parking garage':       'AMBUndr',
+}
+
+def apply_manual_overrides(filepath: str) -> str | None:
+    """Dosya yoluna göre manuel kategori ataması."""
+    path_lower = filepath.lower()
+    for pattern, catid in MANUAL_OVERRIDES.items():
+        if pattern in path_lower:
+            return catid
+    return None
+
+def _keyword_detect(filepath: str, bext_description: str = "") -> str:
+    """Eski keyword tabanlı tespit (CLAP yoksa veya confidence düşükse fallback)."""
+    search_text = (bext_description + " " + filepath).lower()
+    
+    # Not: Bu liste artık sadece fallback için. Ana tespit CLAP zero-shot ile yapılır.
+    FALLBACK_PATTERNS = {
+        'WATRSurf':  ['waves coming in', 'ocean waves', 'surf'],
+        'WATRUndwtr':['underwater', 'uwt', 'submerged', 'hydrophone'],
+        'WATRFall':  ['waterfall', 'falls'],
+        'WATRFlow':  ['river', 'creek', 'stream'],
+        'AMBUrbn':   ['city', 'urban', 'downtown', 'tram', 'metro'],
+        'AMBTraf':   ['traffic', 'highway', 'motorway'],
+        'AMBForst':  ['forest', 'woodland', 'woods'],
+        'AMBSea':    ['beach', 'seaside', 'coastal'],
+        'AMBRurl':   ['rural', 'countryside', 'village'],
+        'CRWDWalla': ['crowd', 'walla', 'murmur'],
+    }
+    
+    scores = {}
+    for catid, patterns in FALLBACK_PATTERNS.items():
+        score = sum(1 for p in patterns if p.lower() in search_text)
+        if score > 0:
+            scores[catid] = score
+    
+    return max(scores, key=scores.get) if scores else 'UNKNOWN'
+
+def precompute_anchors(model) -> dict:
+    """Tüm UCS anchor text'lerini encode et — tek seferlik."""
+    import numpy as np
+    texts = list(UCS_ANCHORS.values())
+    catids = list(UCS_ANCHORS.keys())
+    
+    embs = model.get_text_embedding(texts, use_tensor=False)
+    # L2 normalize
+    embs = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+    
+    return {catid: emb for catid, emb in zip(catids, embs)}
+
+def classify_with_clap(text: str, model, anchor_embeddings: dict) -> str:
+    """CLAP text encoder ile zero-shot classification (Single-file)."""
+    import numpy as np
+    if not text.strip(): return 'UNKNOWN'
+    
+    # Text embedding
+    file_emb = model.get_text_embedding([text], use_tensor=False)
+    file_emb = file_emb / np.linalg.norm(file_emb)
+    
+    # Cosine similarity
+    scores = {}
+    for catid, anchor_emb in anchor_embeddings.items():
+        scores[catid] = float((file_emb @ anchor_emb).item())
+    
+    best = max(scores, key=scores.get)
+    best_score = scores[best]
+    
+    if best_score < 0.25:
+        return 'UNKNOWN'
+    
+    return best
+
+def classify_batch(texts: list[str], model, anchor_embeddings: dict) -> list[str]:
+    """Tüm batch metinlerini tek seferde encode eder (Hızlı)."""
+    import numpy as np
+    if not texts: return []
+    
+    # 1. Text embedding
+    embs = model.get_text_embedding(texts, use_tensor=False)
+    embs = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+    
+    # 2. Anchor matrix hazırlığı
+    anchor_matrix = np.stack(list(anchor_embeddings.values())) # [n_anchors, 512]
+    catids = list(anchor_embeddings.keys())
+    
+    # 3. Matris çarpımı ile cosine similarity (Batch Dot Product)
+    scores_matrix = embs @ anchor_matrix.T # [n_files, n_anchors]
+    
+    best_indices = scores_matrix.argmax(axis=1)
+    best_scores = scores_matrix.max(axis=1)
+    
+    results = []
+    for i, idx in enumerate(best_indices):
+        if best_scores[i] >= 0.25:
+            results.append(catids[idx])
+        else:
+            # Anchor confidence düşükse keyword fallback dene (opsiyonel)
+            results.append('UNKNOWN')
+            
+    return results
+
+def get_ucs_catid_from_metadata(filepath: str) -> str | None:
+    """iXML veya bext'ten UCS CatID oku."""
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(4) != b'RIFF': return None
+            f.read(4)
+            if f.read(4) != b'WAVE': return None
+            while True:
+                chunk_id = f.read(4)
+                if len(chunk_id) < 4: break
+                chunk_size = struct.unpack('<I', f.read(4))[0]
+                if chunk_id == b'iXML':
+                    chunk_data = f.read(chunk_size)
+                    xml = chunk_data.decode('utf-8', errors='ignore')
+                    # UCS standard field
+                    m = re.search(r'<IXML:CATEGORY>(.*?)</IXML:CATEGORY>', xml)
+                    if m: return m.group(1).strip()
+                    # Alternatif field adları
+                    for tag in ['UCS_CATID', 'CATEGORY', 'SUBCATEGORY']:
+                        m = re.search(f'<{tag}>(.*?)</{tag}>', xml)
+                        if m and m.group(1).strip():
+                            return m.group(1).strip()
+                else:
+                    # Chunk'ı atla (chunk_size + padding)
+                    f.seek(chunk_size + (chunk_size % 2), 1)
+    except Exception:
+        pass
+    return None
+
+def detect_ucs_catid(filepath: str, bext_description: str = "", model=None, anchor_embeddings=None) -> str:
+    """
+    Library-agnostic UCS sınıflandırma (Single-file version).
+    """
+    # Öncelik 0: Manuel override (her zaman kazanır)
+    override = apply_manual_overrides(filepath)
+    if override:
+        return override
+
+    # Öncelik 1: iXML metadata
+    ixml_catid = get_ucs_catid_from_metadata(filepath)
+    if ixml_catid:
+        return ixml_catid
+
+    # Öncelik 2: CLAP zero-shot
+    if model and anchor_embeddings:
+        text = bext_description if bext_description else filename_to_caption(filepath)
+        if text.strip():
+            res = classify_with_clap(text, model, anchor_embeddings)
+            if res != 'UNKNOWN':
+                return res
+    
+    # Öncelik 3: Keyword fallback
+    return _keyword_detect(filepath, bext_description)
+
+def read_bext_description(filepath: str) -> str:
+    """WAV dosyasından bext description chunk'ını oku."""
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(4) != b'RIFF': return ""
+            f.read(4)
+            if f.read(4) != b'WAVE': return ""
+            while True:
+                chunk_id = f.read(4)
+                if len(chunk_id) < 4: break
+                chunk_size = struct.unpack('<I', f.read(4))[0]
+                if chunk_id == b'bext':
+                    # bext genelde 602 byte+ metadata içerir, description ilk 256 byte'tır
+                    desc = f.read(min(256, chunk_size))
+                    return desc.rstrip(b'\x00').decode('latin-1', errors='ignore').strip()
+                # Chunk'ı atla (chunk_size + padding)
+                f.seek(chunk_size + (chunk_size % 2), 1)
+    except Exception:
+        pass
+    return ""
+
 def filename_to_caption(path: str) -> str:
     """
-    'sfx/weather/thunder - heavy rain - weather 1.mp3' → 'thunder heavy rain weather'
-
-    - Extension'ı at
-    - '-', '_', '.' ayırıcılarını boşluğa çevir
-    - camelCase ayır
-    - Kütüphane prefix'lerini (3DS02, QP92 vb.) temizle
-    - Sayıları/duplicate boşlukları temizle
-    - Lowercase
+    Önce bext metadata'ya bak, yoksa dosya adını temizle.
+    Her iki durumda da UCS hint ekle.
     """
-    name = Path(path).stem  # uzantı yok
-    # Tire/altçizgi/nokta → boşluk
-    name = re.sub(r"[-_.]+", " ", name)
-    # camelCase → boş ayır (CarEngine → Car Engine)
-    name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+    stem = Path(path).stem
     
-    # Kütüphane kodlarını temizle (İçinde hem harf hem rakam olan 3-7 karakterli kelimeler: 3DS02, QP92 vb.)
-    name = re.sub(r"\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{3,7}\b", " ", name)
-    
-    # Sayıları çıkar (genelde sadece varyant numarası: "rain 1", "rain 2")
-    name = re.sub(r"\b\d+\b", "", name)
-    # Çoklu boşlukları sıkıştır
-    name = re.sub(r"\s+", " ", name).strip().lower()
-    return name
+    # 1. UCS hint (prefix'e göre)
+    ucs_hint = ""
+    for prefix, hint in UCS_HINTS.items():
+        if stem.upper().startswith(prefix):
+            ucs_hint = hint
+            break
+
+    # 2. bext description dene (sadece WAV için)
+    bext = ""
+    if path.lower().endswith('.wav'):
+        bext = read_bext_description(path)
+
+    if bext:
+        # bext var → onu kullan, UCS hint ekle
+        # Ayraçları normalize et (tire, virgül, noktalı virgül → boşluk)
+        clean = re.sub(r'[-_,;]+', ' ', bext).lower().strip()
+        clean = re.sub(r'\s+', ' ', clean)
+        caption = f"{clean} {ucs_hint}".strip() if ucs_hint else clean
+    else:
+        # bext yok → eski dosya adı temizleme mantığı
+        name = re.sub(r"[-_.]+", " ", stem)
+        name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
+        # Kütüphane kodlarını temizle
+        name = re.sub(r"\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{3,7}\b", " ", name)
+        # Sayıları çıkar
+        name = re.sub(r"\b\d+\b", "", name)
+        name = re.sub(r"\s+", " ", name).strip().lower()
+        caption = f"{name} {ucs_hint}".strip() if ucs_hint else name
+
+    return caption
 
 
 def download_ckpt_if_needed(url: str, name: str) -> str:
@@ -165,20 +423,24 @@ def download_ckpt_if_needed(url: str, name: str) -> str:
 
 def load_existing_index(path: str):
     if not os.path.exists(path):
-        return {}, None, None, None
+        return {}, None, None, None, None
     data = np.load(path, allow_pickle=True)
     paths = data["paths"].tolist()
     audio_emb = data["embeddings"]
     text_emb = data["text_embeddings"] if "text_embeddings" in data.files else None
+    catids = data["catids"].tolist() if "catids" in data.files else None
     preset = str(data["preset"]) if "preset" in data.files else None
+    
     audio_dict = dict(zip(paths, audio_emb))
     text_dict = dict(zip(paths, text_emb)) if text_emb is not None else {}
-    return audio_dict, text_dict, preset, data
+    catid_dict = dict(zip(paths, catids)) if catids is not None else {}
+    
+    return audio_dict, text_dict, catid_dict, preset, data
 
 
 def build_model(preset_name: str, device_override: str = None):
     cfg = PRESETS[preset_name]
-    if device_override:
+    if device_override and device_override != "auto":
         device = device_override
     elif torch.cuda.is_available():
         device = "cuda"
@@ -253,7 +515,7 @@ def main():
     parser.add_argument(
         "--min_duration",
         type=float,
-        default=30.0,
+        default=10.0,
         help="Minimum ses süresi (saniye). Bu süreden kısa sesler atlanır.",
     )
     parser.add_argument(
@@ -271,9 +533,9 @@ def main():
     
     print(f"📁 Bulunan dosya: {len(audio_files)}\n")
 
-    existing_audio, existing_text, prev_preset, _ = {}, {}, None, None
+    existing_audio, existing_text, existing_catids, prev_preset, _ = {}, {}, {}, None, None
     if args.update and not args.force:
-        existing_audio, existing_text, prev_preset, _ = load_existing_index(args.index_path)
+        existing_audio, existing_text, existing_catids, prev_preset, _ = load_existing_index(args.index_path)
         if existing_audio and prev_preset and prev_preset != args.preset:
             print(f"⚠️  Var olan index farklı preset ({prev_preset}). --force kullan.")
             return
@@ -333,10 +595,32 @@ def main():
     all_paths = list(existing_audio.keys())
     all_audio = [existing_audio[p] for p in all_paths]
     all_text = [existing_text.get(p) for p in all_paths] if use_filename else []
+    all_catids = [existing_catids.get(p, 'UNKNOWN') for p in all_paths]
+
+    # Duration array — layer-aware search için (mevcut index'ten koru)
+    existing_durations = []
+    if args.update and os.path.exists(args.index_path):
+        try:
+            with np.load(args.index_path, allow_pickle=True) as data:
+                if "durations" in data.files:
+                    existing_durations = data["durations"].tolist()
+                else:
+                    # Durations yoksa, mevcut dosyalar kadar -1.0 (bilinmiyor) ekle
+                    existing_durations = [-1.0] * len(existing_audio)
+        except Exception:
+            existing_durations = [-1.0] * len(existing_audio)
+    else:
+        existing_durations = []
+
+    all_durations = list(existing_durations)
+
 
     # === Audio embedding ===
     t0 = time.time()
     failed = []
+    
+    # CLAP yüklendiyse UCS sınıflandırma için anchor'ları hesapla
+    anchor_embeddings = precompute_anchors(model)
     
     dataset = AudioDataset(to_embed)
     loader = DataLoader(
@@ -371,11 +655,56 @@ def main():
             continue
             
         try:
+            # 1. Audio embedding
             emb = model.get_audio_embedding_from_data(x=valid_waves, use_tensor=False)
             emb = emb / np.linalg.norm(emb, axis=1, keepdims=True)
-            for p, e in zip(valid_paths, emb):
+            
+            # 2. Batch UCS Classification (Çalıştırma)
+            # Önce metadata kontrolü, yoksa CLAP
+            final_batch_catids = []
+            
+            # CLAP tahmini gerekenler için batch hazırla
+            clap_indices = []
+            clap_texts = []
+            
+            for idx, p in enumerate(valid_paths):
+                # 0. Manuel override (highest priority)
+                override = apply_manual_overrides(p)
+                if override:
+                    final_batch_catids.append(override)
+                else:
+                    # 1. iXML/bext metadata önceliği
+                    cid = get_ucs_catid_from_metadata(p)
+                    if cid:
+                        final_batch_catids.append(cid)
+                    else:
+                        # 2. CLAP için sıraya al
+                        final_batch_catids.append(None) # placeholder
+                        clap_indices.append(idx)
+                        bext = read_bext_description(p) if p.endswith('.wav') else ""
+                        clap_texts.append(bext if bext else filename_to_caption(p))
+            
+            # CLAP tahmini gerekiyorsa çalıştır
+            if clap_indices:
+                clap_results = classify_batch(clap_texts, model, anchor_embeddings)
+                for i, res in zip(clap_indices, clap_results):
+                    final_batch_catids[i] = res
+            
+            # 3. Sonuçları kaydet
+            for p, e, cid in zip(valid_paths, emb, final_batch_catids):
                 all_paths.append(p)
                 all_audio.append(e)
+                
+                # Eğer CLAP UNKNOWN verdiyse keyword fallback dene
+                if cid == 'UNKNOWN' or cid is None:
+                    bext = read_bext_description(p) if p.endswith('.wav') else ""
+                    cid = _keyword_detect(p, bext)
+                
+                all_catids.append(cid)
+                
+                # Duration bilgisini ekle
+                dur = get_audio_duration(p)
+                all_durations.append(float(dur) if dur is not None else -1.0)
         except Exception as e:
             tqdm.write(f"  ⚠️  Atlandı ({Path(valid_paths[0]).name}...): {type(e).__name__}: {e}")
             failed.extend(valid_paths)
@@ -412,10 +741,18 @@ def main():
         return
 
     audio_arr = np.stack(all_audio).astype(np.float32)
+
+    # Duration array'i hizala (bazı dosyalar failed olabilir, all_paths ile eşit uzunluk)
+    while len(all_durations) < len(all_paths):
+        all_durations.append(-1.0)
+    all_durations = all_durations[:len(all_paths)]
+
     save_data = {
         "paths": np.array(all_paths),
         "embeddings": audio_arr,
+        "catids": np.array(all_catids),
         "preset": args.preset,
+        "durations": np.array(all_durations, dtype=np.float32),
     }
     if use_filename and all_text and all(t is not None for t in all_text):
         save_data["text_embeddings"] = np.stack(all_text).astype(np.float32)
