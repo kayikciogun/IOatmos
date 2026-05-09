@@ -40,6 +40,7 @@ import numpy as np
 import soundfile as sf
 import librosa
 from torch.utils.data import Dataset, DataLoader
+from caption_enrichment import enrich_caption
 
 
 AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aiff", ".aif")
@@ -110,14 +111,7 @@ def get_audio_duration(file_path):
             return None
 
 
-# Mevcut kütüphane prefix'leri için UCS anahtar kelime haritası
-UCS_HINTS = {
-    'UWT': 'underwater water aquatic submerged',
-    '3DS': 'ambience interior room tone enclosed indoor',
-    'QP':  'quiet ambience background',
-    'UWA': 'underwater bubbles water',
-    'SND': 'sound effect foley',
-}
+# UCS_HINTS kaldırıldı, caption_enrichment.py tarafından yönetiliyor.
 
 # UCS kategori başına bir "anchor text" tanımla (Zero-shot classification için)
 UCS_ANCHORS = {
@@ -355,43 +349,13 @@ def read_bext_description(filepath: str) -> str:
         pass
     return ""
 
-def filename_to_caption(path: str) -> str:
+def filename_to_caption(path: str, catid: str = "") -> str:
     """
-    Önce bext metadata'ya bak, yoksa dosya adını temizle.
-    Her iki durumda da UCS hint ekle.
+    Zenginleştirilmiş caption üretir. 
+    Acoustic context ve perspective prefix'leri ekler.
     """
-    stem = Path(path).stem
-    
-    # 1. UCS hint (prefix'e göre)
-    ucs_hint = ""
-    for prefix, hint in UCS_HINTS.items():
-        if stem.upper().startswith(prefix):
-            ucs_hint = hint
-            break
-
-    # 2. bext description dene (sadece WAV için)
-    bext = ""
-    if path.lower().endswith('.wav'):
-        bext = read_bext_description(path)
-
-    if bext:
-        # bext var → onu kullan, UCS hint ekle
-        # Ayraçları normalize et (tire, virgül, noktalı virgül → boşluk)
-        clean = re.sub(r'[-_,;]+', ' ', bext).lower().strip()
-        clean = re.sub(r'\s+', ' ', clean)
-        caption = f"{clean} {ucs_hint}".strip() if ucs_hint else clean
-    else:
-        # bext yok → eski dosya adı temizleme mantığı
-        name = re.sub(r"[-_.]+", " ", stem)
-        name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
-        # Kütüphane kodlarını temizle
-        name = re.sub(r"\b(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{3,7}\b", " ", name)
-        # Sayıları çıkar
-        name = re.sub(r"\b\d+\b", "", name)
-        name = re.sub(r"\s+", " ", name).strip().lower()
-        caption = f"{name} {ucs_hint}".strip() if ucs_hint else name
-
-    return caption
+    bext = read_bext_description(path) if path.lower().endswith('.wav') else ""
+    return enrich_caption(path, bext, catid)
 
 
 def download_ckpt_if_needed(url: str, name: str) -> str:
@@ -423,19 +387,21 @@ def download_ckpt_if_needed(url: str, name: str) -> str:
 
 def load_existing_index(path: str):
     if not os.path.exists(path):
-        return {}, None, None, None, None
+        return {}, None, None, None, None, {}
     data = np.load(path, allow_pickle=True)
     paths = data["paths"].tolist()
     audio_emb = data["embeddings"]
     text_emb = data["text_embeddings"] if "text_embeddings" in data.files else None
     catids = data["catids"].tolist() if "catids" in data.files else None
     preset = str(data["preset"]) if "preset" in data.files else None
-    
+    cap_lengths = data["caption_lengths"].tolist() if "caption_lengths" in data.files else None
+
     audio_dict = dict(zip(paths, audio_emb))
     text_dict = dict(zip(paths, text_emb)) if text_emb is not None else {}
     catid_dict = dict(zip(paths, catids)) if catids is not None else {}
-    
-    return audio_dict, text_dict, catid_dict, preset, data
+    caplen_dict = dict(zip(paths, cap_lengths)) if cap_lengths is not None else {}
+
+    return audio_dict, text_dict, catid_dict, preset, data, caplen_dict
 
 
 def build_model(preset_name: str, device_override: str = None):
@@ -533,9 +499,9 @@ def main():
     
     print(f"📁 Bulunan dosya: {len(audio_files)}\n")
 
-    existing_audio, existing_text, existing_catids, prev_preset, _ = {}, {}, {}, None, None
+    existing_audio, existing_text, existing_catids, prev_preset, _, existing_cap_lengths = {}, {}, {}, None, None, {}
     if args.update and not args.force:
-        existing_audio, existing_text, existing_catids, prev_preset, _ = load_existing_index(args.index_path)
+        existing_audio, existing_text, existing_catids, prev_preset, _, existing_cap_lengths = load_existing_index(args.index_path)
         if existing_audio and prev_preset and prev_preset != args.preset:
             print(f"⚠️  Var olan index farklı preset ({prev_preset}). --force kullan.")
             return
@@ -584,18 +550,20 @@ def main():
 
     use_filename = not args.no_filename
     if use_filename:
-        captions = [filename_to_caption(f) for f in to_embed]
+        # Önizleme için catid'siz caption'lar (main loop'ta catid ile zenginleşecek)
+        preview_captions = [filename_to_caption(f) for f in to_embed[:3]]
         # Örnek 3 caption göster
         print(f"📝 Filename → caption örnekleri:")
         for i in range(min(3, len(to_embed))):
             print(f"   {Path(to_embed[i]).name}")
-            print(f"   → '{captions[i]}'")
+            print(f"   → '{preview_captions[i]}'")
         print()
 
     all_paths = list(existing_audio.keys())
     all_audio = [existing_audio[p] for p in all_paths]
     all_text = [existing_text.get(p) for p in all_paths] if use_filename else []
     all_catids = [existing_catids.get(p, 'UNKNOWN') for p in all_paths]
+    all_cap_lengths = [existing_cap_lengths.get(p, -1) for p in all_paths]
 
     # Duration array — layer-aware search için (mevcut index'ten koru)
     existing_durations = []
@@ -717,12 +685,28 @@ def main():
 
     # === Filename text embedding ===
     if use_filename:
-        valid_pairs = [(p, c) for p, c in zip(to_embed, captions) if p not in failed]
-        if valid_pairs:
-            print(f"\n⏳ Filename text embedding ({len(valid_pairs)} caption)...")
+        # Başarılı dosyaları ve catid'lerini bul
+        success_paths = [p for p in to_embed if p not in failed]
+        if success_paths:
+            print(f"\n⏳ Filename text embedding ({len(success_paths)} enriched caption)...")
             t1 = time.time()
-            new_paths = [p for p, _ in valid_pairs]
-            new_caps = [c for _, c in valid_pairs]
+            
+            # Catid-aware captions üret (all_catids listesinden en son eklenenleri al)
+            new_files_start_idx = len(existing_audio)
+            new_paths = all_paths[new_files_start_idx:]
+            new_catids = all_catids[new_files_start_idx:]
+            
+            new_caps = [filename_to_caption(p, catid=c) for p, c in zip(new_paths, new_catids)]
+
+            # Caption lengths hesapla
+            new_cap_lengths = [len(cap.split()) for cap in new_caps]
+            all_cap_lengths.extend(new_cap_lengths)
+
+            # Örnek 2 zenginleştirilmiş caption göster
+            print(f"📝 Enriched caption örnekleri:")
+            for i in range(min(2, len(new_caps))):
+                print(f"   → '{new_caps[i]}'")
+            
             text_embs = []
             for i in range(0, len(new_caps), args.text_batch_size):
                 batch_caps = new_caps[i : i + args.text_batch_size]
@@ -747,12 +731,18 @@ def main():
         all_durations.append(-1.0)
     all_durations = all_durations[:len(all_paths)]
 
+    # Caption lengths hizala
+    while len(all_cap_lengths) < len(all_paths):
+        all_cap_lengths.append(-1)
+    all_cap_lengths = all_cap_lengths[:len(all_paths)]
+
     save_data = {
         "paths": np.array(all_paths),
         "embeddings": audio_arr,
         "catids": np.array(all_catids),
         "preset": args.preset,
         "durations": np.array(all_durations, dtype=np.float32),
+        "caption_lengths": np.array(all_cap_lengths, dtype=np.int16),
     }
     if use_filename and all_text and all(t is not None for t in all_text):
         save_data["text_embeddings"] = np.stack(all_text).astype(np.float32)
