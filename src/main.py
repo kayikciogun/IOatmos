@@ -1,6 +1,11 @@
 import os
 import subprocess
 import sys
+import warnings
+
+# HF Hub uyarılarını sustur (token olmadan istek uyarıları)
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 def check_dependencies():
     """Gerekli Python kütüphanelerini kontrol eder ve eksikleri kurar."""
@@ -9,8 +14,6 @@ def check_dependencies():
         "laion_clap": "laion-clap",
         "numpy": "numpy",
         "cv2": "opencv-python",
-        "ffprobe": "ffprobe",
-        "dotenv": "python-dotenv",
         "aiohttp": "aiohttp"
     }
     
@@ -20,14 +23,12 @@ def check_dependencies():
         except ImportError:
             print(f"\n[BİLGİ] '{package}' kütüphanesi eksik. Otomatik kuruluyor...")
             try:
-                subprocess.run([sys.executable, "-m", "pip", "install", package], check=True)
+                subprocess.run([sys.executable, "-m", "pip", "install", package], check=True,
+                             capture_output=True)
                 print(f"✅ '{package}' başarıyla kuruldu.")
             except Exception as e:
                 print(f"❌ '{package}' kurulurken hata oluştu: {e}")
                 print(f"Lütfen manuel kurun: pip install {package}")
-
-# Program başlar başlamaz kütüphaneleri kontrol et
-check_dependencies()
 
 import cv2
 import time
@@ -391,7 +392,7 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
                     "audio_duration": audio_dur,
                     "clip_duration": round(duration, 3),
                     "score": round(score, 4),
-                    "confidence": "high" if score > 0.25 else "medium" if score > 0.18 else "low",
+                    "confidence": "high" if score > 0.030 else "medium" if score > 0.025 else "low",
                     "status": "ok",
                 })
                 rank += 1
@@ -529,8 +530,8 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
     )
 
     
-    # === Adım 9: AAF dosyası oluştur (96kHz embed) ===
-    print(f"\n---> Adım 9: Embedded AAF dosyası oluşturuluyor (sesler 96kHz'e çevrilip gömülecek)...")
+    # === Adım 9: AAF dosyası oluştur (48kHz embed) ===
+    print(f"\n---> Adım 9: Embedded AAF dosyası oluşturuluyor (sesler 48kHz'e çevrilip gömülecek)...")
     try:
         aaf_path = create_embedded_aaf(manifest_path, verbose=True)
         print(f"   ✅ AAF dosyası oluşturuldu: {aaf_path}")
@@ -554,6 +555,8 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
 
 
 if __name__ == "__main__":
+    # Sadece ana process'te çalıştır, subprocess worker'larda tekrar etme
+    check_dependencies()
 
     import argparse
     parser = argparse.ArgumentParser()

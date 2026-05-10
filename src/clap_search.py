@@ -89,7 +89,7 @@ def search(
 
     # Combined CLAP score (audio + text)
     if has_text:
-        clap_score = 0.3 * sim_audio + 0.7 * sim_text
+        clap_score = 0.35 * sim_audio + 0.65 * sim_text
     else:
         clap_score = sim_audio
 

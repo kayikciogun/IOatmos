@@ -277,7 +277,7 @@ def _analyze_local_batch(scene_frame_paths: list[dict], base_model: str, mmproj:
             results.append({**item, **res})
             desc = res.get("sound_description", "")
             if desc:
-                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:50]}...")
+                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:500]}...")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
         return results
