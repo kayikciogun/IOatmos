@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from VtoF.video_analyzer import detect_scenes, save_scene_frames
-from aaf_exporter import create_external_aaf
+from aaf_exporter import create_embedded_aaf
 from vlm_processor import (
     start_llama_server, query_llama_server, stop_llama_server,
     analyze_with_llamacpp_cli, analyze_scenes_batch, SIMPLE_DESIGNER_PROMPT
@@ -529,10 +529,10 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
     )
 
     
-    # === Adım 9: AAF dosyası oluştur ===
-    print(f"\n---> Adım 9: External-Linked AAF dosyası oluşturuluyor...")
+    # === Adım 9: AAF dosyası oluştur (96kHz embed) ===
+    print(f"\n---> Adım 9: Embedded AAF dosyası oluşturuluyor (sesler 96kHz'e çevrilip gömülecek)...")
     try:
-        aaf_path = create_external_aaf(manifest_path, verbose=True)
+        aaf_path = create_embedded_aaf(manifest_path, verbose=True)
         print(f"   ✅ AAF dosyası oluşturuldu: {aaf_path}")
     except Exception as e:
         aaf_path = None

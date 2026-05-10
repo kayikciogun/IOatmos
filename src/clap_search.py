@@ -61,10 +61,10 @@ def search(
     min_score: float | None = None,
 ) -> list[dict]:
     """
-    Hibrit arama. text_weight=0.65 sabit.
+    Hibrit arama. text_weight=1 sabit.
     """
     has_text = idx["text"] is not None
-    text_weight = 0.65
+    text_weight = 0.7
 
     # Pozitif query embedding
     pos_emb = model.get_text_embedding(tags, use_tensor=False)
@@ -144,7 +144,7 @@ def main():
 
     print(f"📦 Index: {len(idx['paths'])} dosya, preset={idx['preset']}")
     print(f"   audio={idx['audio'].shape}, filename_emb={'evet' if has_text else 'hayır'}")
-    print(f"   text_weight=0.65 sabit")
+    print(f"   text_weight=0.5 sabit")
     print()
 
     if args.device != "auto":

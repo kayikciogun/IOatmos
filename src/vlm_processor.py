@@ -39,7 +39,7 @@ SIMPLE_DESIGNER_PROMPT = """You are a professional sound designer analyzing a fr
 Output ONLY a JSON object, no explanation, no markdown:
 
 {
-  "description": "describe the specific audible environment layers of atmosphere design, 10-15 words"
+  "description": "describe environment you see in the frame, 10-15 words"
 }
 
 """
@@ -122,7 +122,7 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
                 {"type": "text", "text": SIMPLE_DESIGNER_PROMPT}
             ]
         }],
-        "temperature": 0.5,
+        "temperature": 0.9,
         "max_tokens": 1000,
         "response_format": {"type": "json_object"},
     }
@@ -232,7 +232,7 @@ def query_llama_server(image_path, retries=3):
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                 {"type": "text", "text": SIMPLE_DESIGNER_PROMPT}
             ]}],
-            "temperature": 0.2, "max_tokens": 200,
+            "temperature": 0.3, "max_tokens": 1000,
         }).encode("utf-8")
 
         req = urllib.request.Request(f"{LLAMA_SERVER_URL}/v1/chat/completions", data=payload, headers={"Content-Type": "application/json"})
