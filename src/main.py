@@ -281,9 +281,12 @@ def get_audio_duration(file_path):
     return None
 
 
-def search_clap_index(analysis_results, index_path="./index.npz", top_k=10):
+def search_clap_index_layered(analysis_results, index_path="./index.npz", top_k=3):
     """
-    Sadeleştirilmiş arama. text_weight=0.65 sabit.
+    Layer-based arama: Her sahne için 3 ayrı Layer (background/foreground/detail)
+    için ayrı arama yapar.
+    
+    Döner: {scene_id: {"background": [(path, score), ...], "foreground": [...], "detail": [...]}}
     """
     import laion_clap
     from clap_index import PRESETS, download_ckpt_if_needed
@@ -296,29 +299,52 @@ def search_clap_index(analysis_results, index_path="./index.npz", top_k=10):
     ckpt = download_ckpt_if_needed(PRESETS["natural"]["ckpt_url"], PRESETS["natural"]["ckpt_name"])
     model.load_ckpt(ckpt)
 
-    results = {}
+    scene_layers = {}
+    total_searches = 0
+    
     for res in analysis_results:
-        pos_desc = res.get('sound_description', '')
-        if not pos_desc: continue
-
-        search_res = smart_search(
-            query=pos_desc,
-            idx=idx,
-            model=model,
-            top_k=top_k
-        )
+        sid = res.get("scene_id", 0)
+        layers = res.get("layers", [])
         
-        hits = [(r["path"], r["score"]) for r in search_res["results"]]
-        results[pos_desc] = hits
+        if not layers:
+            continue
         
-    return results
+        scene_layers[sid] = {}
+        
+        for layer in layers:
+            ltype = layer.get("type", "general").lower().strip()
+            query = layer.get("query", "").strip()
+            if not query:
+                continue
+            
+            # Normalize layer types
+            if ltype in ("ambience", "bg", "env", "environment", "room"):
+                ltype = "background"
+            elif ltype in ("movement", "action", "foley", "movement", "object"):
+                ltype = "foreground"
+            elif ltype in ("texture", "detail", "fx", "spatial", "reverb"):
+                ltype = "detail"
+            
+            search_res = smart_search(
+                query=query,
+                idx=idx,
+                model=model,
+                top_k=top_k
+            )
+            
+            hits = [(r["path"], r["score"]) for r in search_res["results"]]
+            scene_layers[sid][ltype] = hits
+            total_searches += 1
+        
+    print(f"   ✅ {len(scene_layers)} sahne için {total_searches} layer araması tamamlandı.")
+    return scene_layers
 
 
-def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video_fps):
+def build_manifest_top3(video_path, analysis_results, scene_layers, out_dir, video_fps):
     """
-    Top-3 CLAP eşleştirme manifest'i.
-    scene_top3: {scene_id: [(path, score), ...]}  (max 3 sonuç)
-    Her sahne için en iyi 3 ses dosyası, tek sırada listelenir.
+    Layer-based manifest.
+    scene_layers: {scene_id: {"background": [(path, score), ...], "foreground": [...], "detail": [...]}}
+    Her layer tipi ayrı bir track'e (kanala) yerleştirilir.
     silence_required sahnesinde hiçbir ses eklenmez.
     """
     SKIP_START = 10.0
@@ -329,13 +355,24 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
     scenes_manifest = []
     total_matched = 0
 
+    LAYER_TRACK_MAP = {
+        "background": 1,
+        "foreground": 2,
+        "detail": 3,
+    }
+
+    LAYER_LABEL_MAP = {
+        "background": "BG",
+        "foreground": "FG",
+        "detail": "FX",
+    }
+
     for scene_data in analysis_results:
         scene_id = scene_data["scene_id"]
         duration = scene_data.get("duration_seconds") or 0.0
         start_tc = scene_data.get("start_timecode", "00:00:00.000")
         end_tc = scene_data.get("end_timecode", "00:00:00.000")
         silence = scene_data.get("silence_required", False)
-        temporal_evo = scene_data.get("temporal_evolution", "static")
 
         def _tc_to_sec(tc):
             try:
@@ -349,30 +386,45 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
         start_frame = int(start_sec * video_fps)
         end_frame = int(end_sec * video_fps)
 
-        hits = scene_top3.get(scene_id, [])
         layers = []
+        used_files = set()  # Same exact file
+        used_roots = set()  # Same root name (e.g. water_01.wav and water_02.wav)
 
         if not silence:
-            selected_keys = set()
-            rank = 1
-            for path, score in hits:
-                if rank > 3: break
-                
-                # Çeşitlilik kontrolü: Dosya adındaki versiyon/varyasyon eklerini temizle (örn: -48k_3, _take1)
-                # ve aynı kök isme sahip dosyaları aynı sahne için tekrar ekleme.
-                filename = os.path.basename(path).lower()
-                # Uzantıyı at ve sonlardaki sayısal varyasyonları temizle
-                base_name = os.path.splitext(filename)[0]
-                # Regex: Sonlardaki _1, -2, _v3, -take4, _48k gibi yapıları temizler
-                sim_key = re.sub(r'([-_]v?\d+|_?\d+k|_take\d+)$', '', base_name).strip('-_ ')
-                
-                if sim_key in selected_keys:
+            layer_data = scene_layers.get(scene_id, {})
+            
+            for layer_type in ("background", "foreground", "detail"):
+                hits = layer_data.get(layer_type, [])
+                if not hits:
                     continue
-                
+
+                # Pick first hit that hasn't been used (exact or similar root)
+                chosen = None
+                for path, score in hits:
+                    if path in used_files:
+                        continue
+                    
+                    # Extract root name to avoid similar files (e.g. water_01.wav, water_02.wav)
+                    filename = os.path.basename(path).lower()
+                    base_name = os.path.splitext(filename)[0]
+                    root = re.sub(r'([-_]v?\d+|_?\d+k|_take\d+|\d+)$', '', base_name).strip('-_ ')
+                    
+                    if root in used_roots:
+                        continue
+                    
+                    chosen = (path, score, root)
+                    break  # Found valid candidate, stop searching
+
+                if not chosen:
+                    continue
+
+                path, score, root = chosen
+                used_files.add(path)
+                used_roots.add(root)
+
                 audio_dur = get_audio_duration(path)
-                if not audio_dur: continue
-                
-                selected_keys.add(sim_key)
+                if not audio_dur:
+                    continue
 
                 if audio_dur > duration + SKIP_START:
                     source_start = round(random.uniform(SKIP_START, audio_dur - duration), 3)
@@ -382,20 +434,28 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
                     source_start = 0.0
                 source_end = round(source_start + duration, 3)
 
+                confidence = (
+                    "excellent" if score > 80 else
+                    "high" if score > 65 else
+                    "medium" if score > 45 else
+                    "low" if score > 30 else
+                    "poor"
+                )
+
+                track_num = LAYER_TRACK_MAP[layer_type]
                 layers.append({
-                    "track": rank,
-                    "layer_name": f"Match #{rank}",
-                    "layer_type": "top3",
+                    "track": track_num,
+                    "layer_name": LAYER_LABEL_MAP[layer_type],
+                    "layer_type": layer_type,
                     "source_file": path,
                     "source_start_offset": source_start,
                     "source_end_offset": source_end,
                     "audio_duration": audio_dur,
                     "clip_duration": round(duration, 3),
-                    "score": round(score, 4),
-                    "confidence": "high" if score > 0.030 else "medium" if score > 0.025 else "low",
+                    "score": round(score, 2),
+                    "confidence": confidence,
                     "status": "ok",
                 })
-                rank += 1
                 total_matched += 1
 
         scenes_manifest.append({
@@ -404,7 +464,7 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
             "timeline_end": end_tc,
             "duration": round(duration, 3),
             "category": scene_data.get("category", ""),
-            "sound_description": scene_data.get("sound_description", ""),
+            "sound_description": " | ".join([l["query"] for l in scene_data.get("layers", [])]),
             "silence_required": silence,
             "layers": layers,
         })
@@ -414,7 +474,7 @@ def build_manifest_top3(video_path, analysis_results, scene_top3, out_dir, video
         "created_at": datetime.now().strftime("%H%M%S"),
         "video_file": os.path.abspath(video_path),
         "video_fps": video_fps,
-        "pipeline_version": "simple-top3",
+        "pipeline_version": "layered-v1",
         "total_scenes": len(analysis_results),
         "scenes_with_sound": total_matched,
         "silent_scenes": sum(1 for s in scenes_manifest if s["silence_required"]),
@@ -505,36 +565,57 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(analysis_results, f, ensure_ascii=False, indent=4)
 
-    # === Adım 7: Simple Top-3 CLAP eşleştirme ===
-    scene_top3 = {}
+    # === Adım 7: Layer-based CLAP eşleştirme ===
+    scene_layers = {}
     if analysis_results:
         try:
-            # Contrastive CLAP Search (10 sonuç çekiyoruz ki çeşitlilik için alternatif kalsın)
-            match_results = search_clap_index(analysis_results, index_path=index_path, top_k=10)
-            
-            # Sonuçları sahne ID'lerine göre haritala
-            for res in analysis_results:
-                sid = res["scene_id"]
-                pos_desc = res.get("sound_description", "")
-                if pos_desc in match_results:
-                    scene_top3[sid] = match_results[pos_desc]
-                else:
-                    scene_top3[sid] = []
+            scene_layers = search_clap_index_layered(
+                analysis_results, index_path=index_path, top_k=3
+            )
         except Exception as e:
             print(f"   ⚠️ CLAP arama hatası: {e}")
 
     # === Manifest oluştur ===
     print(f"\n---> Adım 8: Manifest oluşturuluyor...")
     manifest_path, manifest = build_manifest_top3(
-        video_path, analysis_results, scene_top3, out_dir, video_fps
+        video_path, analysis_results, scene_layers, out_dir, video_fps
     )
 
+    # === Manifest Özetini Yazdır (Kullanıcının isteği üzerine) ===
+    print(f"\n{'─'*60}")
+    print(f" 📋 MANİFEST ÖZETİ (Sahne Bazlı Eşleşmeler) ".center(60, " "))
+    print(f"{'─'*60}")
+    for s in manifest["scenes"]:
+        sid = s["scene_id"]
+        layers = s["layers"]
+        
+        # Layer sorgularını kompakt göster
+        layer_queries = s["sound_description"].split(" | ") if s["sound_description"] else []
+        desc_preview = " | ".join([q[:1000]  if len(q) > 20 else q for q in layer_queries])
+        
+        print(f"\n🎬 [Sahne {sid:02d}] {desc_preview[:60]}")
+        if s["silence_required"]:
+            print(f"   🔇 SESSİZ SAHNE")
+        elif not layers:
+            print(f"   ⚠️ Eşleşen ses bulunamadı!")
+        else:
+            for l in layers:
+                t = l["track"]
+                score = l["score"]
+                fname = os.path.basename(l["source_file"])
+                label = l.get("layer_name", f"Ch{t}")
+                print(f"   [{label}] {fname} (Skor: {score:.1f}/100)")
+    print(f"\n{'─'*60}")
     
     # === Adım 9: AAF dosyası oluştur (48kHz embed) ===
     print(f"\n---> Adım 9: Embedded AAF dosyası oluşturuluyor (sesler 48kHz'e çevrilip gömülecek)...")
     try:
-        aaf_path = create_embedded_aaf(manifest_path, verbose=True)
-        print(f"   ✅ AAF dosyası oluşturuldu: {aaf_path}")
+        # AAF oluştururken verbose=False yapıyoruz çünkü yukarıda detaylı özeti zaten bastık
+        # Ama AAF içindeki dönüştürme loglarını görmek isterse True kalabilir.
+        # Kullanıcı "manifest logları" dediği için yukarıdaki tabloyu ekledik.
+        aaf_path = create_embedded_aaf(manifest_path, verbose=False) 
+        if aaf_path:
+            print(f"   ✅ AAF dosyası oluşturuldu: {aaf_path}")
     except Exception as e:
         aaf_path = None
         print(f"   ⚠️  AAF oluşturulamadı: {e}")
@@ -542,7 +623,7 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
     pipeline_duration = time.time() - pipeline_start
 
     print(f"\n{'='*60}")
-    print(f"✅ Tüm işlemler başarıyla tamamlandı! (IOatmos v2)")
+    print(f"✅ İŞLEM TAMAMLANDI! (IOatmos v2)")
     print(f"   📁 Çıktı klasörü: {out_dir}")
     print(f"   📋 Manifest: {manifest_path}")
     if aaf_path:

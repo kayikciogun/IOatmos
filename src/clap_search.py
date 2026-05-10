@@ -2,9 +2,10 @@
 """
 clap_search.py — Index'lenmiş kütüphanede hibrit arama.
 
-Sadeleştirilmiş versiyon:
-- text_weight = 0.65 sabit
-- Negatif query, dynamic weight, UCS kategori mask kaldırıldı (etkisiz/ kullanılmıyordu)
+Cosine Similarity Based:
+- Her query kendi percentile'larını kullanır (diğer query'ler etkilemez)
+- 0-100 aralığında normalize edilmiş skorlar
+- Per-query min/max normalizasyonu (global batch değil)
 """
 
 import argparse
@@ -32,7 +33,6 @@ def load_index(path: str):
         raise FileNotFoundError(f"Index yok: {path}. Önce: python clap_index.py --audio_dir ...")
     data = np.load(path, allow_pickle=True)
 
-    # Captions varsa BM25 corpus oluştur
     bm25 = None
     if "captions" in data.files:
         from rank_bm25 import BM25Okapi
@@ -62,100 +62,148 @@ def build_model(preset: str, device: str):
     return model, cfg
 
 
+# ─── Cosine Search (raw similarity, no percentile tricks) ─────────────────
 
-def search(
-    tags: list[str],
+def _scale_to_100(raw_scores: np.ndarray) -> np.ndarray:
+    """Ham cosine similarity'leri [0,1] aralığından kabaca [0,100] eşler.
+    Basitçe: score = raw * 100, ama normalize edici hiçbir şey yapmaz.
+    """
+    return np.clip(raw_scores * 100.0, 0.0, 100.0)
+
+
+def search_cosine_single(
+    query: str,
+    idx: dict,
+    model,
+    text_weight: float = 0.55,
+) -> list[dict]:
+    """Tek bir query string için arama yapar.
+    Döndürür: [{path, score, raw_sim, audio_sim, text_sim}, ...]
+    score: raw cosine * 100, gerçek eşleşmeyi yansıtır.
+    """
+    has_text = idx["text"] is not None
+
+    # Single query embedding
+    pos_emb = model.get_text_embedding([query], use_tensor=False)
+    pos_emb = pos_emb / np.linalg.norm(pos_emb, axis=1, keepdims=True)
+
+    # Cosine similarities (matrices already normalized from indexing)
+    sim_audio = (pos_emb @ idx["audio"].T)[0]
+    sim_text = None
+    if has_text:
+        sim_text = (pos_emb @ idx["text"].T)[0]
+
+    # Hybrid score
+    if has_text and sim_text is not None:
+        hybrid = (1 - text_weight) * sim_audio + text_weight * sim_text
+    else:
+        hybrid = sim_audio
+
+    # Scale to 0-100 WITHOUT percentile tricks (just multiply by 100)
+    scaled = _scale_to_100(hybrid)
+
+    # Sort descending
+    order = np.argsort(-scaled)
+    return [
+        {
+            "path": idx["paths"][j],
+            "score": float(scaled[j]),
+            "raw_sim": float(hybrid[j]),
+            "audio_sim": float(sim_audio[j]),
+            "text_sim": float(sim_text[j]) if sim_text is not None else 0.0,
+        }
+        for j in order
+    ]
+
+
+def smart_search(
+    query,
     idx: dict,
     model,
     top_k: int = 3,
-    rrf_k: int = 60,
+    text_weight: float = 0.55,
     min_score: float | None = None,
-) -> list[dict]:
+) -> dict:
+    """Tekil arama veya multi-query arama.
+    - query: str veya list[str]
+    - Eğer liste ise: her query ayrı aranır, sonuçlar çeşitliliğe göre merge edilir.
     """
-    RRF Fusion: BM25 (lexical) + CLAP audio + CLAP text.
-    Skor değil sıralama kullanır — ölçek sorunu yok.
-    """
-    has_text = idx["text"] is not None
-    has_bm25 = idx.get("bm25") is not None
-    n = len(idx["paths"])
-
-    # Pozitif query embedding
-    pos_emb = model.get_text_embedding(tags, use_tensor=False)
-    pos_emb = pos_emb / np.linalg.norm(pos_emb, axis=1, keepdims=True)
-
-    # Audio ve text similarity
-    sim_audio = pos_emb @ idx["audio"].T
-    sim_text = (pos_emb @ idx["text"].T) if has_text else None
-
-    # Combined CLAP score (audio + text)
-    if has_text:
-        clap_score = 0.35 * sim_audio + 0.65 * sim_text
+    if isinstance(query, str):
+        queries = [query]
+    elif isinstance(query, list):
+        queries = [q for q in query if q and str(q).strip()]
     else:
-        clap_score = sim_audio
+        queries = [str(query)]
 
-    output = []
-    for i, tag in enumerate(tags):
+    if not queries:
+        return {"results": [], "source": "cosine", "confidence": "poor", "best_score": 0}
 
-        # CLAP rank (dosya_idx → rank)
-        clap_order = np.argsort(-clap_score[i])
-        clap_rank = np.empty(n, dtype=int)
-        clap_rank[clap_order] = np.arange(n)
+    # Tek query → basit arama
+    if len(queries) == 1:
+        all_results = search_cosine_single(
+            query=queries[0],
+            idx=idx,
+            model=model,
+            text_weight=text_weight,
+        )
+        if min_score is not None:
+            all_results = [r for r in all_results if r["score"] >= min_score]
+        candidates = all_results[:top_k]
+        best = candidates[0]["score"] if candidates else 0
+        return {
+            "results": candidates,
+            "source": "cosine",
+            "confidence": _score_to_confidence(best),
+            "best_score": best,
+        }
 
-        # BM25 rank
-        if has_bm25:
-            bm25_scores = idx["bm25"].get_scores(tag.lower().split())
-            bm25_order = np.argsort(-bm25_scores)
-            bm25_rank = np.empty(n, dtype=int)
-            bm25_rank[bm25_order] = np.arange(n)
+    # Multi-query: her query ayrı aranır, sonra çeşitlilik + skor ile merge
+    per_query = {}
+    for q in queries:
+        per_query[q] = search_cosine_single(
+            query=q, idx=idx, model=model, text_weight=text_weight,
+        )
 
-        # RRF: 1/(k + rank) — her sistemden katkı
-        if has_bm25:
-            rrf = (1 / (rrf_k + clap_rank) + 1 / (rrf_k + bm25_rank))
-        else:
-            rrf = 1 / (rrf_k + clap_rank)
+    # Merge: her dosyanın en yüksek skorunu al
+    file_best = {}
+    for q, results in per_query.items():
+        for i, r in enumerate(results):
+            path = r["path"]
+            if path not in file_best or r["score"] > file_best[path]["score"]:
+                file_best[path] = {
+                    **r,
+                    "best_query": q,
+                    "query_rank": i + 1,
+                }
 
-        top_indices = np.argsort(-rrf)
-        results = []
-        for j in top_indices:
-            if min_score is not None and rrf[j] < min_score:
-                continue
-            if len(results) >= top_k:
-                break
-            results.append({
-                "path": idx["paths"][j],
-                "score": float(rrf[j]),
-                "clap_score": float(clap_score[i, j]),
-                "audio_sim": float(sim_audio[i, j]),
-                "text_sim": float(sim_text[i, j]) if sim_text is not None else 0.0,
-                "bm25_rank": int(bm25_rank[j]) if has_bm25 else -1,
-                "clap_rank": int(clap_rank[j]),
-            })
-        output.append({"tag": tag, "results": results})
-
-    return output
-
-
-def smart_search(query, idx, model, top_k=3):
-    """
-    RRF Fusion arama: BM25 + CLAP audio + CLAP text.
-    Re-rank kaldırıldı, sıralama tabanlı fusion kullanılıyor.
-    """
-    all_results = search(
-        tags=[query],
-        idx=idx,
-        model=model,
-        top_k=top_k,
-    )
-    candidates = all_results[0]["results"]
-
-    # RRF skorları ~0.01-0.06 arasında, eşikler buna göre ayarlandı
-    final_best_score = candidates[0]["score"] if candidates else 0
+    all_merged = sorted(file_best.values(), key=lambda x: x["score"], reverse=True)
+    if min_score is not None:
+        all_merged = [r for r in all_merged if r["score"] >= min_score]
+    candidates = all_merged[:top_k]
+    best = candidates[0]["score"] if candidates else 0
 
     return {
         "results": candidates,
-        "source": "rrf",
-        "confidence": "high" if final_best_score > 0.040 else "medium" if final_best_score > 0.030 else "low",
+        "source": "cosine_multi",
+        "confidence": _score_to_confidence(best),
+        "best_score": best,
+        "num_queries": len(queries),
     }
+
+
+def _score_to_confidence(score: float) -> str:
+    """Score is raw cosine * 100.
+    CLAP cosine scale: great matches ~0.80, okay ~0.55, weak ~0.35, unrelated ~<0.20.
+    """
+    if score > 80:
+        return "excellent"
+    if score > 65:
+        return "high"
+    if score > 45:
+        return "medium"
+    if score > 30:
+        return "low"
+    return "poor"
 
 
 def main():
@@ -177,8 +225,7 @@ def main():
     has_text = idx["text"] is not None
 
     print(f"📦 Index: {len(idx['paths'])} dosya, preset={idx['preset']}")
-    print(f"   audio={idx['audio'].shape}, text_emb={'evet' if has_text else 'hayır'}, bm25={'evet' if idx.get('bm25') is not None else 'hayır'}")
-    print(f"   fusion=RRF (k=60), clap_w=0.7")
+    print(f"   audio={idx['audio'].shape}, text_emb={'evet' if has_text else 'hayır'}, score=cosine(0-100)")
     print()
 
     if args.device != "auto":
@@ -200,20 +247,22 @@ def main():
             query=tag,
             idx=idx,
             model=model,
-            top_k=args.top_k
+            top_k=args.top_k,
+            min_score=args.min_score,
         )
         results.append({"tag": tag, **res})
 
     print("=" * 78)
     for item in results:
-        print(f"\n🏷️  '{item['tag']}' [Source: {item['source']}, Conf: {item['confidence']}]")
+        print(f"\n🏷️  '{item['tag']}' [Conf: {item['confidence'].upper()}, Best: {item['best_score']:.1f}/100]")
         print("-" * 78)
         if not item["results"]:
             print(f"  (sonuç bulunamadı)")
             continue
         for rank, r in enumerate(item["results"], 1):
             disp = r["path"] if args.full_path else Path(r["path"]).name
-            print(f"  {rank}. {r['score']:+.4f}  {disp}")
+            print(f"  {rank}. Score: {r['score']:.1f}/100  {disp}")
+            print(f"     └─ raw={r['raw_sim']:.4f}  audio={r['audio_sim']:.4f}  text={r['text_sim']:.4f}")
     print("\n" + "=" * 78)
 
 

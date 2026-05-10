@@ -35,13 +35,20 @@ LLAMA_SERVER_URL = f"http://127.0.0.1:{LLAMA_SERVER_PORT}"
 #   Prompt
 # ============================================================
 
-SIMPLE_DESIGNER_PROMPT = """You are a professional sound designer analyzing a frame.
-Output ONLY a JSON object, no explanation, no markdown:
+SIMPLE_DESIGNER_PROMPT = """You are a sound designer watching ONE frame.
+For this scene, provide 3 DIFFERENT ambience descriptions, each must include day/night/time.
+
+Return ONLY a JSON object with 3 fields, no explanation:
 
 {
-  "description": "describe environment you see in the frame, 10-15 words"
+  "base": "broad environment ambience with time (e.g. 'busy city street at noon ambience')",
+  "near": "specific location ambience with time (e.g. 'quiet office interior daytime room tone')",
+  "distant": "background texture ambience with atmosphere (e.g. 'distant traffic night echo urban')"
 }
 
+All 3 fields MUST describe ambience sounds (no foley, no dialogue, no specific actions).
+Each MUST include: day or night.
+Keep each query 4-10 words.
 """
 
 # ============================================================
@@ -49,51 +56,65 @@ Output ONLY a JSON object, no explanation, no markdown:
 # ============================================================
 
 def _empty_response():
-    return {"sound_description": ""}
+    return {"layers": []}
 
 def _parse_json_response(raw: str) -> dict:
+    """Parse JSON ambience layer response: {"base": "...", "near": "...", "distant": "..."}"""
     try:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
-            return {
-                "sound_description": str(data.get("description", "")).strip(),
-            }
-    except: pass
+        obj_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not obj_match:
+            return _empty_response()
+        data = json.loads(obj_match.group())
+
+        # {"base": "...", "near": "...", "distant": "..."}
+        type_map = {"base": "background", "near": "foreground", "distant": "detail"}
+        if any(k in data for k in ("base", "near", "distant")):
+            layers = []
+            for key in ("base", "near", "distant"):
+                if key in data and data[key]:
+                    layers.append({
+                        "type": type_map.get(key, key),
+                        "query": str(data[key]).strip(),
+                    })
+            return {"layers": layers}
+    except Exception:
+        pass
     return _empty_response()
 
 def parse_vlm_response(raw_text: str) -> dict:
-    """VLM yanıtını parse eder. CATEGORY alanı artık kullanılmıyor."""
+    """VLM yanıtını parse eder — sadece 3-layer array."""
     if not raw_text or not raw_text.strip():
         return _empty_response()
 
-    # Temizlik (Resim tagleri, Düşünce tagleri ve Markdown temizliği)
+    # Temizlik
     raw_text = re.sub(r'\[img-\d+\]', '', raw_text)
     raw_text = re.sub(r'<思考>.*?</思考>', '', raw_text, flags=re.DOTALL)
     raw_text = re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL)
     raw_text = raw_text.replace('**', '').replace('*', '')
 
-    # Önce JSON formatı dene
+    # 1. JSON array/object dene
     json_result = _parse_json_response(raw_text)
-    if json_result.get("sound_description"):
+    if json_result.get("layers"):
         return json_result
 
-    # Fallback: Serbest metin, description aramaya çalış
-    description = ""
-    desc_match = re.search(r'DESCRIPTION:\s*(.*)', raw_text, re.IGNORECASE)
-    if desc_match:
-        description = desc_match.group(1).strip()
+    # 2. Fallback: A, B, C satır formatı
+    layers = []
+    for line in raw_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        if ':' in line:
+            parts = line.split(':', 1)
+            ltype = parts[0].strip().lower()
+            query = parts[1].strip()
+            if query and not ltype.startswith("here") and "layer" not in ltype.lower()[:2]:
+                layers.append({"type": ltype, "query": query})
 
-    if not description:
-        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
-        for line in lines:
-            if "CATEGORY:" in line.upper(): continue
-            if "DESCRIPTION:" in line.upper(): continue
-            if not any(skip in line.lower() for skip in ["thinking", "analyze", "{", "}"]):
-                description = line.strip()
-                break
+    # Hiç bir şey yoksa tek satır → genel
+    if not layers and raw_text.strip():
+        layers = [{"type": "general", "query": raw_text.strip()}]
 
-    return {"sound_description": description}
+    return {"layers": layers}
 
 # ============================================================
 #   Online (OpenRouter) Batch
@@ -173,9 +194,10 @@ async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int 
         results = []
         for item, parsed in zip(scene_frame_paths, responses):
             results.append({**item, **parsed})
-            desc = parsed.get("sound_description", "")
-            if desc:
-                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:50]}...")
+            layers = parsed.get("layers", [])
+            if layers:
+                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
+                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
 
@@ -276,8 +298,10 @@ def _analyze_local_batch(scene_frame_paths: list[dict], base_model: str, mmproj:
             res = analyze_with_llamacpp_cli(item["frame_path"], base_model, mmproj)
             results.append({**item, **res})
             desc = res.get("sound_description", "")
-            if desc:
-                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:500]}...")
+            layers = res.get("layers", [])
+            if layers:
+                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
+                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
         return results
@@ -287,9 +311,10 @@ def _analyze_local_batch(scene_frame_paths: list[dict], base_model: str, mmproj:
         for item in scene_frame_paths:
             res = query_llama_server(item["frame_path"])
             results.append({**item, **res})
-            desc = res.get("sound_description", "")
-            if desc:
-                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:50]}...")
+            layers = res.get("layers", [])
+            if layers:
+                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
+                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
         return results
