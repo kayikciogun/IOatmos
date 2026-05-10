@@ -490,17 +490,14 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
             "temporal_evolution": "static"
         })
 
-    # Lokal mod ise server'ı başlat
-    server_proc = None
-    if vlm_mode == "local":
-        server_proc = start_llama_server(base_model, mmproj)
-
     print(f"\n---> Adım 6: {len(scene_items)} sahne analiz ediliyor (Mod: {vlm_mode.upper()})...")
-    analysis_results = analyze_scenes_batch(scene_items, mode=vlm_mode, max_workers=8)
-
-    # Server'ı kapat
-    if server_proc:
-        stop_llama_server(server_proc)
+    analysis_results = analyze_scenes_batch(
+        scene_items,
+        mode=vlm_mode,
+        base_model=base_model,
+        mmproj=mmproj,
+        max_workers=8,
+    )
 
     # JSON çıktı (jsonlar klasörüne)
     output_json = os.path.join(json_dir, f"{video_basename}_sound_analysis.json")
@@ -560,6 +557,8 @@ if __name__ == "__main__":
 
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--vlm-mode", type=str, choices=["online", "local"], default="online",
+                        help="VLM analiz modu: online (OpenRouter API) veya local (llama.cpp server). Default: online")
     parser.add_argument("--video", type=str, help="İşlenecek spesifik video yolu")
     parser.add_argument("--model", type=str, help="Hangi VLM modelini kullan (1, 2, 3...). Belirtilmezse menü sorar.")
     parser.add_argument("--auto-model", action="store_true", help="Her video öncesi model seçim menüsü göster")
@@ -577,8 +576,8 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     model_candidates = detect_available_models()
     
-    # 4. VLM Analiz Modu (Default: Online)
-    vlm_mode = "online"
+    # 4. VLM Analiz Modu (CLI argümanından)
+    vlm_mode = args.vlm_mode
         
     # Mevcut video seçim mantığına vlm_mode bilgisini de ekle
     # process_video fonksiyonunu güncelleyip vlm_mode parametresini ekleyeceğiz

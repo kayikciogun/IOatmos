@@ -8,3 +8,4 @@ inputs/
 index.npz
 llama.cpp/
 sfx/
+.env

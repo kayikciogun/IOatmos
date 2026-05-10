@@ -128,6 +128,24 @@ function run_pipeline() {
         return
     fi
 
+    # === VLM MODU SEÇİMİ ===
+    echo -e "\n${CYAN}🧠 VLM Analiz Modu Seçin:${NC}"
+    echo -e "  ${GREEN}[1] Online${NC}  — OpenRouter API (internet gerekli, hızlı)"
+    echo -e "  ${YELLOW}[2] Local${NC}   — llama.cpp server (yerel model, offline)"
+    echo ""
+    read -p "Seçiminiz (1-2, varsayılan: 1): " vlm_choice
+
+    VLM_MODE_ARG=""
+    if [[ "$vlm_choice" == "2" ]]; then
+        VLM_MODE_ARG="--vlm-mode local"
+        echo -e "\n${YELLOW}🔧 Yerel VLM modu seçildi. models/ klasöründe GGUF + mmproj çifti gereklidir.${NC}"
+        echo -e "   (Eğer model yoksa kurulum menüsünden indirebilirsiniz.)"
+    else
+        VLM_MODE_ARG="--vlm-mode online"
+        echo -e "\n${GREEN}🌐 Online VLM modu seçildi (OpenRouter API).${NC}"
+    fi
+    echo ""
+
     mkdir -p inputs outputs
     shopt -s nullglob
     VIDEOS=(inputs/*.{mp4,mov,avi,mkv,MP4,MOV,AVI,MKV})
@@ -159,11 +177,11 @@ function run_pipeline() {
 
     if [[ "$vid_choice" == "0" ]]; then
         echo -e "\n${CYAN}🚀 Tüm videolar sırayla işleniyor...${NC}\n"
-        python src/main.py
+        python src/main.py ${VLM_MODE_ARG}
     elif [[ "$vid_choice" =~ ^[0-9]+$ ]] && [[ "$vid_choice" -gt 0 && "$vid_choice" -le ${#VIDEOS[@]} ]]; then
         SELECTED_VIDEO="${VIDEOS[$((vid_choice-1))]}"
         echo -e "\n${CYAN}🚀 Seçilen video işleniyor: $(basename "$SELECTED_VIDEO")${NC}\n"
-        python src/main.py --video "$SELECTED_VIDEO"
+        python src/main.py ${VLM_MODE_ARG} --video "$SELECTED_VIDEO"
     else
         echo -e "\n${RED}❌ Geçersiz seçim! İşlem iptal edildi.${NC}"
         read -p "Ana menüye dönmek için Enter'a basın..."
