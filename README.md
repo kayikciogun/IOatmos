@@ -1,6 +1,6 @@
 # 🎬 IOatmos — Otomatik Sinematik Ses Tasarımcısı
 
-**Videoyu koy, çalıştır, ses tasarımını al.** Tamamen yerel, tamamen otomatik, internet gerektirmez.
+**Videoyu koy, çalıştır, ses tasarımını al.** Ses eşleştirme tamamen yerel CLAP ile yapılır. VLM sahne analizi için internet bağlantısı (OpenRouter API) gereklidir.
 
 Bu sistem bir videoyu alır, sahnelere ayırır, yapay zeka ile her sahneyi analiz eder, ses kütüphanenizden en uygun sesleri bulur ve doğrudan DAW'ınıza (Logic Pro, Pro Tools, DaVinci Resolve vb.) import edebileceğiniz bir AAF dosyası oluşturur.
 
@@ -11,8 +11,8 @@ Bu sistem bir videoyu alır, sahnelere ayırır, yapay zeka ile her sahneyi anal
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────┐     ┌─────────┐
 │  Video       │────▶│ Sahne Tespit │────▶│  VLM Analiz  │────▶│ CLAP     │────▶│  AAF    │
-│  (inputs/)   │     │ (SceneDet.)  │     │ (Qwen2.5-VL) │     │ Eşleştir │     │ Export  │
-└─────────────┘     └──────────────┘     └──────────────┘     └──────────┘     └─────────┘
+│  (inputs/)   │     │ (SceneDet.)  │     │ (OpenRouter  │     │ Eşleştir │     │ Export  │
+└─────────────┘     └──────────────┘     │  API)        │     └──────────┘     └─────────┘
                           │                      │                   │               │
                      scenes.json          sound_analysis.json   manifest.json   sound_design.aaf
 ```
@@ -21,14 +21,12 @@ Bu sistem bir videoyu alır, sahnelere ayırır, yapay zeka ile her sahneyi anal
 
 | Adım | Ne Yapıyor | Teknoloji |
 |------|-----------|-----------|
-| 1-2 | llama.cpp motorunu indirir ve macOS için derler | git, cmake, Metal |
-| 3 | Görüntü anlama modelini indirir (~3.3 GB) | Qwen2.5-VL-3B-Instruct |
-| 4 | Videoyu sahnelere ayırır | PySceneDetect (AdaptiveDetector) |
-| 5 | Her sahnenin ortasından kare çıkarır | OpenCV |
-| 6 | Her kareyi analiz edip ses ortamını tanımlar | llama-server (HTTP API) |
-| 7 | Tanımlamaları ses kütüphanesinde arar | CLAP (text→audio similarity) |
-| 8 | Manifest JSON oluşturur | Python |
-| 9 | DAW'a import edilebilir AAF dosyası oluşturur | pyaaf2 |
+| 1 | Videoyu sahnelere ayırır | PySceneDetect (AdaptiveDetector) |
+| 2 | Her sahnenin ortasından kare çıkarır | OpenCV |
+| 3 | Her kareyi analiz edip ses ortamını tanımlar | OpenRouter API (grok-4.1-fast) |
+| 4 | Tanımlamaları ses kütüphanesinde arar | CLAP (text→audio similarity) |
+| 5 | Manifest JSON oluşturur | Python |
+| 6 | DAW'a import edilebilir AAF dosyası oluşturur | pyaaf2 |
 
 ---
 
@@ -62,12 +60,11 @@ IOatmos, Apple Silicon (M-Serisi) çiplerin gücünü sonuna kadar kullanmak üz
 
 - **Ultra Hızlı İndeksleme:** `soundfile` ve PyTorch `DataLoader` (paralel işlem) altyapısı sayesinde ses kütüphanenizi saniyede 10+ dosya hızıyla indeksler.
 - **Akıllı Temizlik:** Dosya isimlerindeki anlamsız kütüphane kodlarını (`3DS02`, `QP92` vb.) otomatik temizler, sadece anlamlı kelimeleri (Caption) kullanarak daha doğru eşleşme yapar.
-- **MPS (GPU) Desteği:** Tüm yapay zeka analizleri Apple GPU (Metal Performance Shaders) üzerinde koşar.
+- **MPS (GPU) Desteği:** Ses indeksleme ve CLAP eşleştirme Apple GPU (Metal Performance Shaders) üzerinde koşar.
 - **Güvenli Okuma:** Çok uzun ses dosyalarında bile donma/çökme yaşanmaması için 120 saniyelik akıllı okuma limiti mevcuttur.
-- **Dinamik Ağırlıklandırma (Dynamic Weight):** Her ses dosyasının caption kalitesine göre otomatik text/audio ağırlığı belirler. Kısa caption'lar audio-dominant (tw=0.35), zengin caption'lar text-dominant (tw=0.55).
-- **UCS Kategori Sınıflandırma:** CLAP zero-shot ile ses dosyalarını otomatik UCS CatID'lerine (WATR-WATERFALL, AMB-Forest, vb.) ayırır. Su kategorilerinde minimum text weight garantisi (0.50) ile yanlış eşleşmeleri önler.
-- **Caption Zenginleştirme:** Dosya adlarından akustik perspektiv (underwater, interior, distant) ve kategori bazlı context üreterek CLAP eşleşme doğruluğunu artırır.
-- **Negatif Sorgu Desteği:** `--negative` ile istenmeyen ses karakterlerini (örn. "underwater") sonuçlardan çıkarabilirsiniz.
+- **Sabit Hibrit Skorlama:** CLAP aramada text ağırlığı sabit %65, audio ağırlığı %35 olarak kalibre edilmiştir. Dosya adı/caption metinleri ile LLM description arasındaki eşleşmeyi önceliklendirir.
+- **Saf CLAP Eşleştirme:** Kategori filtreleme veya re-rank bonus olmadan, doğrudan CLAP embedding benzerliği ile arama yapılır. Sadece text/audio hibrit skor belirleyicidir.
+- **Dosya Adı Temizleme:** Ses dosyası isimlerindeki anlamsız kütüphane kodlarını (`3DS02`, `QP92` vb.) otomatik temizleyerek CLAP caption'larını optimize eder.
 
 ---
 
@@ -79,17 +76,15 @@ IOatmos/
 ├── src/
 │   ├── main.py               # 🎯 Ana pipeline — video'dan AAF'a
 │   ├── clap_index.py         # 🎵 Ses kütüphanesini CLAP ile indexle (zero-shot UCS classification)
-│   ├── clap_search.py        # 🔍 Hibrit arama (audio + text similarity, dynamic weight)
-│   ├── caption_enrichment.py # 📝 Dosya adından zenginleştirilmiş caption üret
-│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (online/local)
+│   ├── clap_search.py        # 🔍 Hibrit arama (audio + text similarity, text_weight=0.65)
+│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (OpenRouter API)
+│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (OpenRouter API)
 │   ├── aaf_exporter.py       # 🎛️ AAF dosyası oluşturucu (Logic/Pro Tools/DaVinci)
-│   ├── update_caption_lengths.py  # 📏 Mevcut index'e caption uzunluğu ekle (bir kez çalıştır)
 │   └── VtoF/
 │       └── video_analyzer.py # 🎬 Sahne tespiti ve kare çıkarma
 ├── inputs/                   # 📥 Videolarınızı buraya koyun
 ├── outputs/                  # 📤 Tüm çıktılar (AAF, manifest, frame'ler)
-├── models/                   # 🤖 VLM model dosyaları (GGUF + mmproj)
-├── llama.cpp/                # ⚡ Inference motoru (llama-server)
+├── models/                   # 💾 CLAP checkpoint dosyası (otomatik indirilir)
 ├── sfx/                      # 🎶 Ses efekt kütüphaneniz
 ├── Docs/                     # 📖 Dokümantasyon
 ├── requirements.txt          # 📦 Python bağımlılıkları
@@ -119,10 +114,10 @@ IOatmos/
 ## ❓ Sık Sorulan Sorular
 
 **S: İnternet gerekli mi?**
-H: Sadece ilk kurulumda (model indirme). Sonrasında tamamen offline çalışır.
+H: VLM sahne analizi (Adım 3) için internet bağlantısı ve OpenRouter API anahtarı gereklidir. Ses eşleştirme tamamen yerel CLAP ile yapılır, offline çalışır.
 
 **S: Ne kadar sürer?**
-M1 MacBook'ta: ~30sn (10 sahneli video). Model yükleme bir kere yapılır, sonraki sahneler çok hızlı.
+M1 MacBook'ta: Sahne analizi ~5-10sn/sahne (API bağlantı hızına bağlı), ses eşleştirme ~1-2sn/sahne.
 
 **S: Hangi video formatları desteklenir?**
 MP4, MOV, AVI, MKV.
@@ -131,10 +126,10 @@ MP4, MOV, AVI, MKV.
 WAV, MP3, AIFF, FLAC, OGG, M4A — hepsi desteklenir.
 
 **S: `index.npz` ne zaman yeniden oluşturulmalı?**
-Kütüphanenize yeni dosyalar eklediğinizde `--update` ile hızlıca güncelleyin. Caption uzunluklarını index'e eklemek için bir kez `python src/update_caption_lengths.py` çalıştırın.
+Kütüphanenize yeni dosyalar eklediğinizde `--update` ile hızlıca güncelleyin. Sadece yeni dosyalar embed edilir, mevcut index korunur.
 
-**S: Dinamik weight nedir?**
-Her ses dosyasının caption uzunluğuna göre otomatik text/audio ağırlığı belirler. Kısa caption'lar (örn. sadece dosya adı) audio-dominant (tw=0.35), zengin caption'lar (Boom/3DS bext metadata) text-dominant (tw=0.55). Bu, dosya başına en iyi skorlama stratejisini uygular.
+**S: CLAP aramada text/audio oranı nedir?**
+Sabit `text_weight=0.65` kullanılır. Yani %65 text (caption/description) benzerliği, %35 audio spektrogram benzerliği. Bu, LLM'in çıkardığı "waves crashing surf roar" gibi metnin, ses dosyasının zenginleştirilmiş caption'ıyla eşleşmesini önceliklendirir.
 
 ---
 

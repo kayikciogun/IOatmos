@@ -2,8 +2,6 @@ import os
 import re
 import json
 import base64
-import subprocess
-import time
 import asyncio
 import aiohttp
 from pathlib import Path
@@ -19,38 +17,21 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip().strip('"')
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "x-ai/grok-4.1-fast"
 
-CATEGORY_LIST = (
-    "AMB-URBAN, AMB-TRAFFIC, AMB-SUBURBAN, AMB-PARK, "
-    "AMB-FOREST, AMB-RURAL, AMB-SEASIDE, AMB-LAKESIDE, AMB-FARM, AMB-DESERT, "
-    "AMB-OFFICE, AMB-RESTAURANT, AMB-PUBLIC, AMB-MARKET, AMB-SCHOOL, "
-    "AMB-RESIDENTIAL, AMB-ROOM-TONE, AMB-CONSTRUCTION, AMB-INDUSTRIAL, "
-    "AMB-UNDERGROUND, AMB-NAUTICAL, "
-    "WATR-SURF, WATR-WATERFALL, WATR-FLOW, WATR-UNDERWATER, "
-    "VEH-INTERIOR, CRWD-WALLA"
-)
-
-SIMPLE_DESIGNER_PROMPT = f"""You are a professional sound designer analyzing a video frame.
+SIMPLE_DESIGNER_PROMPT = """You are a professional sound designer analyzing a frame.
 Output ONLY a JSON object, no explanation, no markdown:
 
-{{
-  "category": "ONE from: {CATEGORY_LIST}",
-  "description": "natural language description of audible sounds, 10-15 words",
-  "is_silent": false
-}}
+{
+  "description": "describe the specific audible environment layers of atmosphere design, 10-15 words"
+}
 
-Rules:
-- description must describe AUDIBLE sounds only, never visual elements
-- Empty/static room with no people = AMB-ROOM-TONE
-- Beach surface waves = WATR-SURF (never AMB-UNDERWATER for surface)
-- Cave or tunnel = AMB-UNDERGROUND
-- Dense city with trams/buses = AMB-URBAN (not AMB-TRAFFIC)"""
+"""
 
 def _image_to_b64(image_path: str) -> str:
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 def _empty_response():
-    return {"category": "AMB-ROOM-TONE", "sound_description": "", "silence_required": False}
+    return {"sound_description": ""}
 
 def _parse_json_response(raw: str) -> dict:
     try:
@@ -58,15 +39,12 @@ def _parse_json_response(raw: str) -> dict:
         if match:
             data = json.loads(match.group())
             return {
-                "category":          str(data.get("category", "AMB-ROOM-TONE")).strip(),
                 "sound_description": str(data.get("description", "")).strip(),
-                "silence_required":  bool(data.get("is_silent", False)),
             }
     except: pass
     return _empty_response()
 
 async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> dict:
-    """Async OpenRouter API çağrısı."""
     if not OPENROUTER_API_KEY:
         print("   ❌ HATA: OPENROUTER_API_KEY bulunamadı!")
         return _empty_response()
@@ -77,6 +55,7 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
 
     payload = {
         "model": MODEL,
+        "reasoning": {"effort": "medium"},
         "messages": [{
             "role": "user",
             "content": [
@@ -84,8 +63,8 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
                 {"type": "text", "text": SIMPLE_DESIGNER_PROMPT}
             ]
         }],
-        "temperature": 0.1,
-        "max_tokens": 150,
+        "temperature": 0.5,
+        "max_tokens": 1000,
         "response_format": {"type": "json_object"},
     }
 
@@ -100,9 +79,8 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
         try:
             async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60) as resp:
                 if resp.status == 401:
-                    print(f"   ❌ YETKİ HATASI (401): API anahtarı geçersiz ({image_path})")
+                    print(f"   ❌ YETKİ HATASI (401): API anahtarı geçersiz")
                     return _empty_response()
-                
                 if resp.status != 200:
                     err_text = await resp.text()
                     print(f"   ⚠️ API Hatası ({resp.status}): {err_text[:200]}")
@@ -110,7 +88,7 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
 
                 data = await resp.json()
                 if "choices" not in data:
-                    print(f"   ⚠️ Yanıt formatı hatalı: {data}")
+                    print(f"   ⚠️ Yanıt formatı hatalı")
                     continue
 
                 raw = data["choices"][0]["message"]["content"].strip()
@@ -123,7 +101,6 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
     return _empty_response()
 
 async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int = 16) -> list[dict]:
-    # API anahtarı debug (maskeli)
     if OPENROUTER_API_KEY:
         masked = OPENROUTER_API_KEY[:10] + "..." + OPENROUTER_API_KEY[-4:]
         print(f"   🔑 API Anahtarı aktif: {masked}")
@@ -131,8 +108,7 @@ async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int 
     connector = aiohttp.TCPConnector(limit=max_workers)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_call_openrouter_async(session, item["frame_path"]) for item in scene_frame_paths]
-        print(f"   ⏳ {len(tasks)} istek gönderildi, yanıt bekleniyor...")
-        
+        print(f"   ⏳ {len(tasks)} istek gönderildi...")
         responses = await asyncio.gather(*tasks)
         
         results = []
@@ -140,9 +116,9 @@ async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int 
             results.append({**item, **parsed})
             desc = parsed.get("sound_description", "")
             if desc:
-                print(f"   ✅ Scene {item['scene_id']:02d} [{parsed['category']:15s}] {desc[:50]}...")
+                print(f"   ✅ Scene {item['scene_id']:02d} {desc[:50]}...")
             else:
-                print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT GELDİ")
+                print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
             
         return results
 
@@ -150,13 +126,12 @@ def analyze_scenes_batch(scene_frame_paths: list[dict], mode: str = "online", **
     if mode == "online":
         return asyncio.run(_analyze_online_batch(scene_frame_paths))
     else:
-        # Local mode (sequential)
         results = []
         for item in scene_frame_paths:
-            # Buraya yerel llama.cpp mantığı gelecek
             results.append({**item, **_empty_response()})
         return results
 
+# Yerel llama.cpp placeholder
 def start_llama_server(*args, **kwargs): return None
 def stop_llama_server(*args, **kwargs): pass
 def query_llama_server(*args, **kwargs): return _empty_response()

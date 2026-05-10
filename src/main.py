@@ -244,7 +244,10 @@ def download_models():
 # ======= VLM Fonksiyonları vlm_processor.py dosyasına taşındı.
 
 def get_audio_duration(file_path):
-    """Ses dosyasının süresini saniye cinsinden döndürür. FFprobe kullanır."""
+    """Ses dosyasının süresini saniye cinsinden döndürür.
+    Önce ffprobe binary, sonra ffprobe Python modülü, son soundfile fallback.
+    """
+    # 1. ffprobe binary
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -253,12 +256,33 @@ def get_audio_duration(file_path):
         )
         return float(result.stdout.strip())
     except Exception:
-        return None
+        pass
+
+    # 2. ffprobe Python module fallback
+    try:
+        import ffprobe
+        probe = ffprobe.FFProbe(file_path)
+        for stream in probe.streams:
+            dur = stream.duration
+            if dur:
+                return float(dur)
+    except Exception:
+        pass
+
+    # 3. soundfile fallback
+    try:
+        import soundfile as sf
+        info = sf.info(file_path)
+        return info.duration
+    except Exception:
+        pass
+
+    return None
 
 
-def search_clap_index(analysis_results, index_path="./index.npz", top_k=10, text_weight=0.4):
+def search_clap_index(analysis_results, index_path="./index.npz", top_k=10):
     """
-    B+C Birleşik Arama Mimarisi kullanarak arama yapar.
+    Sadeleştirilmiş arama. text_weight=0.65 sabit.
     """
     import laion_clap
     from clap_index import PRESETS, download_ckpt_if_needed
@@ -266,7 +290,6 @@ def search_clap_index(analysis_results, index_path="./index.npz", top_k=10, text
     idx = load_clap_index(index_path)
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     
-    # Modeli yükle
     print(f"⏳ CLAP Text Encoder yükleniyor...")
     model = laion_clap.CLAP_Module(enable_fusion=True, amodel='HTSAT-tiny', device=device)
     ckpt = download_ckpt_if_needed(PRESETS["natural"]["ckpt_url"], PRESETS["natural"]["ckpt_name"])
@@ -275,24 +298,16 @@ def search_clap_index(analysis_results, index_path="./index.npz", top_k=10, text
     results = {}
     for res in analysis_results:
         pos_desc = res.get('sound_description', '')
-        pos_category = res.get('category', 'AMB-ROOM-TONE')
         if not pos_desc: continue
-        
-        # smart_search (Aşama A+B+C - Soft Filter)
+
         search_res = smart_search(
-            query=pos_desc,        # Zengin natural language query
-            ucs_category=pos_category, # Soft hint
+            query=pos_desc,
             idx=idx,
             model=model,
             top_k=top_k
         )
         
-        # Sonuçları 'path, score' tuple listesine çevir
-        hits = []
-        for r in search_res["results"]:
-            hits.append((r["path"], r["score"]))
-        
-        # Key olarak description kullanıyoruz (manifest'te eşleşmesi için)
+        hits = [(r["path"], r["score"]) for r in search_res["results"]]
         results[pos_desc] = hits
         
     return results
