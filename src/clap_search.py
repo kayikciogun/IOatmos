@@ -31,10 +31,20 @@ def load_index(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Index yok: {path}. Önce: python clap_index.py --audio_dir ...")
     data = np.load(path, allow_pickle=True)
+
+    # Captions varsa BM25 corpus oluştur
+    bm25 = None
+    if "captions" in data.files:
+        from rank_bm25 import BM25Okapi
+        captions = data["captions"].tolist()
+        tokenized = [cap.lower().split() for cap in captions]
+        bm25 = BM25Okapi(tokenized)
+
     return {
         "paths":       data["paths"].tolist(),
         "audio":       data["embeddings"],
         "text":        data["text_embeddings"] if "text_embeddings" in data.files else None,
+        "bm25":        bm25,
         "preset":      str(data["preset"]) if "preset" in data.files else "natural",
     }
 
@@ -58,13 +68,16 @@ def search(
     idx: dict,
     model,
     top_k: int = 3,
+    rrf_k: int = 60,
     min_score: float | None = None,
 ) -> list[dict]:
     """
-    Hibrit arama. text_weight=1 sabit.
+    RRF Fusion: BM25 (lexical) + CLAP audio + CLAP text.
+    Skor değil sıralama kullanır — ölçek sorunu yok.
     """
     has_text = idx["text"] is not None
-    text_weight = 0.7
+    has_bm25 = idx.get("bm25") is not None
+    n = len(idx["paths"])
 
     # Pozitif query embedding
     pos_emb = model.get_text_embedding(tags, use_tensor=False)
@@ -74,28 +87,48 @@ def search(
     sim_audio = pos_emb @ idx["audio"].T
     sim_text = (pos_emb @ idx["text"].T) if has_text else None
 
-    # Combined score: text_weight=0.65 sabit
+    # Combined CLAP score (audio + text)
     if has_text:
-        pos_combined = (1 - text_weight) * sim_audio + text_weight * sim_text
+        clap_score = 0.3 * sim_audio + 0.7 * sim_text
     else:
-        pos_combined = sim_audio
+        clap_score = sim_audio
 
     output = []
     for i, tag in enumerate(tags):
-        final_scores = pos_combined[i].copy()
 
-        order = np.argsort(-final_scores)
+        # CLAP rank (dosya_idx → rank)
+        clap_order = np.argsort(-clap_score[i])
+        clap_rank = np.empty(n, dtype=int)
+        clap_rank[clap_order] = np.arange(n)
+
+        # BM25 rank
+        if has_bm25:
+            bm25_scores = idx["bm25"].get_scores(tag.lower().split())
+            bm25_order = np.argsort(-bm25_scores)
+            bm25_rank = np.empty(n, dtype=int)
+            bm25_rank[bm25_order] = np.arange(n)
+
+        # RRF: 1/(k + rank) — her sistemden katkı
+        if has_bm25:
+            rrf = (1 / (rrf_k + clap_rank) + 1 / (rrf_k + bm25_rank))
+        else:
+            rrf = 1 / (rrf_k + clap_rank)
+
+        top_indices = np.argsort(-rrf)
         results = []
-        for j in order:
-            if min_score is not None and final_scores[j] < min_score:
-                break
+        for j in top_indices:
+            if min_score is not None and rrf[j] < min_score:
+                continue
             if len(results) >= top_k:
                 break
             results.append({
                 "path": idx["paths"][j],
-                "score": float(final_scores[j]),
+                "score": float(rrf[j]),
+                "clap_score": float(clap_score[i, j]),
                 "audio_sim": float(sim_audio[i, j]),
                 "text_sim": float(sim_text[i, j]) if sim_text is not None else 0.0,
+                "bm25_rank": int(bm25_rank[j]) if has_bm25 else -1,
+                "clap_rank": int(clap_rank[j]),
             })
         output.append({"tag": tag, "results": results})
 
@@ -104,8 +137,8 @@ def search(
 
 def smart_search(query, idx, model, top_k=3):
     """
-    Basitleştirilmiş arama: Sadece global CLAP search (text_weight=0.65).
-    Re-rank kaldırıldı.
+    RRF Fusion arama: BM25 + CLAP audio + CLAP text.
+    Re-rank kaldırıldı, sıralama tabanlı fusion kullanılıyor.
     """
     all_results = search(
         tags=[query],
@@ -115,12 +148,13 @@ def smart_search(query, idx, model, top_k=3):
     )
     candidates = all_results[0]["results"]
 
+    # RRF skorları ~0.01-0.06 arasında, eşikler buna göre ayarlandı
     final_best_score = candidates[0]["score"] if candidates else 0
 
     return {
         "results": candidates,
-        "source": "global",
-        "confidence": "high" if final_best_score > 0.45 else "medium" if final_best_score > 0.30 else "low",
+        "source": "rrf",
+        "confidence": "high" if final_best_score > 0.040 else "medium" if final_best_score > 0.030 else "low",
     }
 
 
@@ -143,8 +177,8 @@ def main():
     has_text = idx["text"] is not None
 
     print(f"📦 Index: {len(idx['paths'])} dosya, preset={idx['preset']}")
-    print(f"   audio={idx['audio'].shape}, filename_emb={'evet' if has_text else 'hayır'}")
-    print(f"   text_weight=0.5 sabit")
+    print(f"   audio={idx['audio'].shape}, text_emb={'evet' if has_text else 'hayır'}, bm25={'evet' if idx.get('bm25') is not None else 'hayır'}")
+    print(f"   fusion=RRF (k=60), clap_w=0.7")
     print()
 
     if args.device != "auto":
