@@ -34,6 +34,7 @@ def load_index(path: str):
     data = np.load(path, allow_pickle=True)
 
     bm25 = None
+    captions = None
     if "captions" in data.files:
         from rank_bm25 import BM25Okapi
         captions = data["captions"].tolist()
@@ -45,6 +46,7 @@ def load_index(path: str):
         "audio":       data["embeddings"],
         "text":        data["text_embeddings"] if "text_embeddings" in data.files else None,
         "bm25":        bm25,
+        "captions":    captions,
         "preset":      str(data["preset"]) if "preset" in data.files else "natural",
     }
 
@@ -71,13 +73,71 @@ def _scale_to_100(raw_scores: np.ndarray) -> np.ndarray:
     return np.clip(raw_scores * 100.0, 0.0, 100.0)
 
 
-def search_cosine_single(
+def _normalize_bm25(scores: np.ndarray) -> np.ndarray:
+    """BM25 skorlarını percentile-based normalize et.
+    Top 10% → 100, median → ~50, bottom → 0 yaklaşımı.
+    Bu min-max'dan daha robusttur (outlier'a karşı).
+    """
+    if len(scores) == 0 or scores.max() == 0:
+        return np.zeros_like(scores)
+    # Percentile-based: p90 -> 90, median -> 50
+    p99 = np.percentile(scores, 99)
+    p50 = np.percentile(scores, 50)
+    if p99 <= p50:
+        return np.clip(scores * 100.0 / (scores.max() + 1e-6), 0, 100)
+    # Normalize: (score - p50) / (p99 - p50) * 80 + 20 → median ~20, p99 ~100
+    norm = (scores - p50) / (p99 - p50) * 80 + 20
+    return np.clip(norm, 0, 100)
+
+
+def preprocess_query(query: str, layer_type: str = None) -> str:
+    """VLM çıktısındaki query'leri optimize et.
+    - Gereksiz sıfatları kaldır
+    - Stopword'leri temizle (cümle akışı bozmak için sadece bazıları)
+    - Layer-specific rewrite
+    """
+    # Küçült
+    q = query.lower().strip()
+
+    # Layer-aware düzeltmeler
+    if layer_type == "background":
+        # Background: genel ambience odaklı, spesifik locasyon detaylarını azalt
+        # "cozy tiny home kitchen morning room tone" → "home kitchen ambience morning"
+        pass
+    elif layer_type == "foreground":
+        # Foreground: orta mesafe, interior/exterior önemli
+        pass
+    elif layer_type == "detail":
+        # Detail: distant/echo/reverb önemli
+        pass
+
+    # Remove words that are too specific/visual and don't help audio search
+    visual_words = {"sunlit", "sunny", "bright", "dark", "shadow", "colorful",
+                    "beautiful", "picturesque", "scenic", "glistening", "golden"}
+    tokens = q.split()
+    filtered = [t for t in tokens if t not in visual_words]
+    q = " ".join(filtered)
+
+    # Normalize common phrases
+    replacements = {
+        "room tone": "room tone ambience",
+        "daytime ambience": "day ambience",
+        "nighttime ambience": "night ambience",
+    }
+    for old, new in replacements.items():
+        q = q.replace(old, new)
+
+    return q.strip()
+
+
+def search_clap_cosine(
     query: str,
     idx: dict,
     model,
-    text_weight: float = 0.55,
+    text_weight: float = 0.75,
+    min_score: float | None = None,
 ) -> list[dict]:
-    """Tek bir query string için arama yapar.
+    """Tek bir query string için CLAP cosine + optional text hybrid arama.
     Döndürür: [{path, score, raw_sim, audio_sim, text_sim}, ...]
     score: raw cosine * 100, gerçek eşleşmeyi yansıtır.
     """
@@ -94,13 +154,32 @@ def search_cosine_single(
         sim_text = (pos_emb @ idx["text"].T)[0]
 
     # Hybrid score
-    if has_text and sim_text is not None:
+    if has_text and sim_text is not None and text_weight > 0:
         hybrid = (1 - text_weight) * sim_audio + text_weight * sim_text
     else:
         hybrid = sim_audio
 
-    # Scale to 0-100 WITHOUT percentile tricks (just multiply by 100)
+    # Scale to 0-100
     scaled = _scale_to_100(hybrid)
+
+    if min_score is not None:
+        mask = scaled >= min_score
+        if not mask.any():
+            # Fallback: en iyi sonuçları yine de döndür
+            pass
+        else:
+            order = np.argsort(-scaled)
+            order = [j for j in order if mask[j]]
+            return [
+                {
+                    "path": idx["paths"][j],
+                    "score": float(scaled[j]),
+                    "raw_sim": float(hybrid[j]),
+                    "audio_sim": float(sim_audio[j]),
+                    "text_sim": float(sim_text[j]) if sim_text is not None else 0.0,
+                }
+                for j in order
+            ]
 
     # Sort descending
     order = np.argsort(-scaled)
@@ -116,17 +195,71 @@ def search_cosine_single(
     ]
 
 
+# Backward compat alias
+search_cosine_single = search_clap_cosine
+
+
+def _bm25_boost(
+    query: str,
+    idx: dict,
+    base_results: list[dict],
+    boost_weight: float = 0.25,
+    top_n: int = 100,
+) -> list[dict]:
+    """BM25 skorlarını base CLAP sonuçlarına ADDITIVE fuse et.
+    - Sadece CLAP top-N adayları üzerinde BM25 çalıştır (hızlı)
+    - Percentile-based normalize ile skalalar uyumlu
+    - CLAP skor dominant, BM25 supplementary boost
+    """
+    if idx["bm25"] is None:
+        return base_results
+
+    tokenized_query = query.lower().split()
+    bm25_scores = idx["bm25"].get_scores(tokenized_query)
+
+    # Percentile-based normalize BM25 → ~0-25 aralığı (CLAP skalası ile uyumlu)
+    p99 = np.percentile(bm25_scores, 99)
+    p50 = np.percentile(bm25_scores, 50)
+    if p99 <= p50:
+        norm_scores = np.zeros_like(bm25_scores)
+    else:
+        norm_scores = (bm25_scores - p50) / (p99 - p50) * 20 + 5
+        norm_scores = np.clip(norm_scores, 0, 30)
+
+    candidate_paths = {r["path"] for r in base_results[:top_n]}
+    path_to_idx = {p: i for i, p in enumerate(idx["paths"])}
+
+    for r in base_results:
+        if r["path"] in candidate_paths:
+            pidx = path_to_idx.get(r["path"])
+            if pidx is not None:
+                bm25_norm = float(norm_scores[pidx])
+                # ADDITIVE: CLAP dominant + BM25 supplementary
+                r["score"] = r["score"] + boost_weight * bm25_norm
+                r["bm25_norm"] = bm25_norm
+
+    base_results.sort(key=lambda x: x["score"], reverse=True)
+    return base_results
+
+
 def smart_search(
     query,
     idx: dict,
     model,
     top_k: int = 3,
-    text_weight: float = 0.55,
+    text_weight: float = 1.0,
     min_score: float | None = None,
+    layer_type: str | None = None,
+    bm25_boost_weight: float = 0.25,
+    use_bm25: bool = True,
 ) -> dict:
-    """Tekil arama veya multi-query arama.
+    """Akıllı hibrit arama: CLAP + BM25 + layer-aware optimizasyon.
+
     - query: str veya list[str]
-    - Eğer liste ise: her query ayrı aranır, sonuçlar çeşitliliğe göre merge edilir.
+    - Eğer liste ise: her query ayrı aranır, sonuçlar merge edilir.
+    - layer_type: "background" | "foreground" | "detail" → query ön işleme
+    - bm25_boost_weight: 0.0 = BM25 yok, 0.25 = %25 BM25 boost (önerilen)
+    - use_bm25: BM25 ile boost et (index'te varsa)
     """
     if isinstance(query, str):
         queries = [query]
@@ -136,35 +269,42 @@ def smart_search(
         queries = [str(query)]
 
     if not queries:
-        return {"results": [], "source": "cosine", "confidence": "poor", "best_score": 0}
+        return {"results": [], "source": "none", "confidence": "poor", "best_score": 0}
 
-    # Tek query → basit arama
-    if len(queries) == 1:
-        all_results = search_cosine_single(
-            query=queries[0],
+    # Preprocess queries
+    processed = [preprocess_query(q, layer_type) for q in queries]
+
+    # Multi-query: her query ayrı aranır, sonra merge
+    per_query = {}
+    for q in processed:
+        results = search_clap_cosine(
+            query=q,
             idx=idx,
             model=model,
             text_weight=text_weight,
         )
+
+        # Optional BM25 boost (only on top candidates)
+        if use_bm25 and idx["bm25"] is not None:
+            results = _bm25_boost(q, idx, results, boost_weight=bm25_boost_weight, top_n=100)
+
+        per_query[q] = results
+
+    # Tek query → direkt döndür
+    if len(processed) == 1:
+        all_results = per_query[processed[0]]
         if min_score is not None:
             all_results = [r for r in all_results if r["score"] >= min_score]
         candidates = all_results[:top_k]
         best = candidates[0]["score"] if candidates else 0
         return {
             "results": candidates,
-            "source": "cosine",
+            "source": "hybrid" if (use_bm25 and idx["bm25"]) else "cosine",
             "confidence": _score_to_confidence(best),
             "best_score": best,
         }
 
-    # Multi-query: her query ayrı aranır, sonra çeşitlilik + skor ile merge
-    per_query = {}
-    for q in queries:
-        per_query[q] = search_cosine_single(
-            query=q, idx=idx, model=model, text_weight=text_weight,
-        )
-
-    # Merge: her dosyanın en yüksek skorunu al
+    # Multi-query merge: her dosyanın en yüksek skorunu al
     file_best = {}
     for q, results in per_query.items():
         for i, r in enumerate(results):
@@ -184,7 +324,7 @@ def smart_search(
 
     return {
         "results": candidates,
-        "source": "cosine_multi",
+        "source": "hybrid_multi" if (use_bm25 and idx["bm25"]) else "cosine_multi",
         "confidence": _score_to_confidence(best),
         "best_score": best,
         "num_queries": len(queries),

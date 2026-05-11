@@ -329,7 +329,11 @@ def search_clap_index_layered(analysis_results, index_path="./index.npz", top_k=
                 query=query,
                 idx=idx,
                 model=model,
-                top_k=top_k
+                top_k=top_k,
+                text_weight=1.0,
+                layer_type=ltype,
+                bm25_boost_weight=0.25,
+                use_bm25=True,
             )
             
             hits = [(r["path"], r["score"]) for r in search_res["results"]]
@@ -464,7 +468,6 @@ def build_manifest_top3(video_path, analysis_results, scene_layers, out_dir, vid
             "timeline_end": end_tc,
             "duration": round(duration, 3),
             "category": scene_data.get("category", ""),
-            "sound_description": " | ".join([l["query"] for l in scene_data.get("layers", [])]),
             "silence_required": silence,
             "layers": layers,
         })
@@ -589,11 +592,7 @@ def extract_and_analyze(video_path, base_model, mmproj, vlm_mode="online", index
         sid = s["scene_id"]
         layers = s["layers"]
         
-        # Layer sorgularını kompakt göster
-        layer_queries = s["sound_description"].split(" | ") if s["sound_description"] else []
-        desc_preview = " | ".join([q[:1000]  if len(q) > 20 else q for q in layer_queries])
-        
-        print(f"\n🎬 [Sahne {sid:02d}] {desc_preview[:60]}")
+        print(f"\n🎬 [Sahne {sid:02d}]")
         if s["silence_required"]:
             print(f"   🔇 SESSİZ SAHNE")
         elif not layers:

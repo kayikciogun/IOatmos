@@ -22,7 +22,7 @@ except ImportError:
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip().strip('"').strip("'")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "x-ai/grok-4.1-fast"
+MODEL = "grok-4.1-fast"
 
 # ============================================================
 #   Local (llama.cpp Server) Ayarları
@@ -196,7 +196,7 @@ async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int 
             results.append({**item, **parsed})
             layers = parsed.get("layers", [])
             if layers:
-                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
+                q_list = ", ".join([f"{l['type']}={l['query'][:500]}" for l in layers])
                 print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
