@@ -749,9 +749,12 @@ def save_scene_frames(video_path, scenes, output_dir="data/temp/frames", max_dim
                     sample_times.append(max(min(end_sec - epsilon, end_sec), start_sec))
 
                 names = []
-                if "start" in samples: names.append("start")
-                if "mid" in samples: names.append("mid")
-                if "end" in samples: names.append("end")
+                if "start" in samples:
+                    names.append("start")
+                if "mid" in samples:
+                    names.append("mid")
+                if "end" in samples:
+                    names.append("end")
 
                 for idx, sample_time in enumerate(sample_times):
                     frame_index = int(round(sample_time * fps))

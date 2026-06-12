@@ -15,6 +15,99 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
+REQUIRED_PYTHON="3.12"
+
+function brew_shellenv_if_needed() {
+    if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+}
+
+function find_python312() {
+    brew_shellenv_if_needed
+    local candidates=()
+    if command -v brew &>/dev/null; then
+        local brew_prefix
+        brew_prefix="$(brew --prefix python@3.12 2>/dev/null || true)"
+        if [[ -n "$brew_prefix" ]]; then
+            candidates+=("$brew_prefix/bin/python3.12")
+        fi
+    fi
+    candidates+=(
+        "/opt/homebrew/bin/python3.12"
+        "/opt/homebrew/opt/python@3.12/bin/python3.12"
+        "/usr/local/bin/python3.12"
+        "/usr/local/opt/python@3.12/bin/python3.12"
+        "python3.12"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function venv_python_version() {
+    if [[ -x ".venv/bin/python" ]]; then
+        .venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null
+    fi
+}
+
+function venv_pip() {
+    .venv/bin/python -m pip "$@"
+}
+
+function install_python_deps() {
+    venv_pip install --upgrade pip
+    venv_pip install -r requirements.txt
+    venv_pip install --no-deps laion-clap==1.1.6
+    venv_pip install pyaaf2 scenedetect opencv-python ffprobe
+}
+
+function ensure_venv() {
+    local python312
+    local recreated=0
+    python312="$(find_python312)" || true
+    if [[ -z "$python312" ]]; then
+        echo -e "${RED}❌ Python ${REQUIRED_PYTHON} bulunamadı.${NC}"
+        echo -e "   Kurulum menüsünden ${BLUE}[2] Kurulumu Yap${NC} seçerek python@3.12 kurulmasını sağlayın."
+        return 1
+    fi
+
+    local current_ver=""
+    if [[ -d ".venv" ]]; then
+        current_ver="$(venv_python_version)"
+    fi
+
+    if [[ -n "$current_ver" && "$current_ver" != "$REQUIRED_PYTHON" ]]; then
+        echo -e "  ${YELLOW}⚠️  Mevcut ortam Python ${current_ver} — Python ${REQUIRED_PYTHON} ile yeniden oluşturuluyor...${NC}"
+        rm -rf .venv
+        current_ver=""
+        recreated=1
+    fi
+
+    if [[ ! -d ".venv" ]]; then
+        echo -e "  ⏳ Python ortamı oluşturuluyor ($("$python312" --version | cut -d' ' -f1-2))..."
+        "$python312" -m venv .venv
+        echo -e "  ${GREEN}✅ Python ortamı oluşturuldu ($(venv_python_version))${NC}"
+        recreated=1
+    else
+        echo -e "  ${GREEN}✅ Python ortamı hazır (Python $(venv_python_version))${NC}"
+    fi
+
+    if [[ "$recreated" -eq 1 ]]; then
+        echo -e "  ⏳ Python kütüphaneleri kuruluyor..."
+        install_python_deps
+        echo -e "  ${GREEN}✅ Kütüphaneler kuruldu${NC}"
+    fi
+    return 0
+}
+
 function show_header() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
@@ -41,6 +134,7 @@ function run_setup() {
     echo ""
 
     echo -e "${YELLOW}━━━ [2/6] Gerekli programlar kuruluyor... ━━━${NC}"
+    brew_shellenv_if_needed
     for pkg in "python@3.12" "ffmpeg" "cmake" "git"; do
         if brew list "$pkg" &>/dev/null; then
             echo -e "  ${GREEN}✅ $pkg zaten yüklü${NC}"
@@ -52,20 +146,14 @@ function run_setup() {
     echo ""
 
     echo -e "${YELLOW}━━━ [3/6] Python ortamı hazırlanıyor... ━━━${NC}"
-    if [[ ! -d ".venv" ]]; then
-        python3 -m venv .venv
-        echo -e "  ${GREEN}✅ Python ortamı oluşturuldu${NC}"
-    else
-        echo -e "  ${GREEN}✅ Python ortamı zaten hazır${NC}"
+    if ! ensure_venv; then
+        read -p "Devam etmek için Enter'a basın..."
+        return
     fi
-    source .venv/bin/activate
     echo ""
 
     echo -e "${YELLOW}━━━ [4/6] Yapay zeka kütüphaneleri kuruluyor... ━━━${NC}"
-    pip install --quiet --upgrade pip 2>/dev/null
-    pip install --quiet -r requirements.txt 2>/dev/null
-    pip install --quiet --no-deps laion-clap==1.1.6 2>/dev/null
-    pip install --quiet pyaaf2 scenedetect opencv-python ffprobe 2>/dev/null
+    install_python_deps
     echo -e "  ${GREEN}✅ Tüm kütüphaneler kuruldu${NC}"
     echo ""
 
@@ -86,12 +174,10 @@ function run_setup() {
 }
 
 function update_index() {
-    if [[ ! -f ".venv/bin/activate" ]]; then
-        echo -e "${RED}❌ Kurulum bulunamadı! Lütfen önce kurulumu tamamlayın (Seçenek 2).${NC}"
+    if ! ensure_venv; then
         read -p "Devam etmek için Enter'a basın..."
         return
     fi
-    source .venv/bin/activate
 
     echo -e "\n${CYAN}📢 Ses kütüphanenizi seçmeniz gerekiyor.${NC}"
     echo "Şimdi bir klasör seçme penceresi açılacak."
@@ -106,8 +192,11 @@ function update_index() {
     
     if [[ -n "$SFX_DIR" && -d "$SFX_DIR" ]]; then
         echo -e "\n${YELLOW}⏳ Ses kütüphanesi indexleniyor... (Bu işlem ses sayısına göre vakit alabilir)${NC}"
-        python src/clap_index.py --audio_dir "$SFX_DIR" --update
-        echo -e "\n${GREEN}✅ Ses kütüphanesi hazır!${NC}"
+        if .venv/bin/python src/clap_index.py --audio_dir "$SFX_DIR" --update; then
+            echo -e "\n${GREEN}✅ Ses kütüphanesi hazır!${NC}"
+        else
+            echo -e "\n${RED}❌ Indexleme başarısız oldu. Yukarıdaki hata mesajını kontrol edin.${NC}"
+        fi
     else
         echo -e "\n${RED}⚠️  Klasör seçilmedi.${NC}"
     fi
@@ -115,12 +204,10 @@ function update_index() {
 }
 
 function run_pipeline() {
-    if [[ ! -f ".venv/bin/activate" ]]; then
-        echo -e "${RED}❌ Kurulum bulunamadı! Lütfen önce kurulumu yapın (Seçenek 2).${NC}"
+    if ! ensure_venv; then
         read -p "Devam etmek için Enter'a basın..."
         return
     fi
-    source .venv/bin/activate
 
     if [[ ! -f "index.npz" ]]; then
         echo -e "${RED}⚠️  Ses kütüphanesi henüz indexlenmemiş! Lütfen önce indexleyin (Seçenek 3).${NC}"
@@ -175,21 +262,30 @@ function run_pipeline() {
     echo ""
     read -p "Seçiminiz (0-${#VIDEOS[@]}): " vid_choice
 
+    local pipeline_ok=0
     if [[ "$vid_choice" == "0" ]]; then
         echo -e "\n${CYAN}🚀 Tüm videolar sırayla işleniyor...${NC}\n"
-        python src/main.py ${VLM_MODE_ARG}
+        if .venv/bin/python src/main.py ${VLM_MODE_ARG}; then
+            pipeline_ok=1
+        fi
     elif [[ "$vid_choice" =~ ^[0-9]+$ ]] && [[ "$vid_choice" -gt 0 && "$vid_choice" -le ${#VIDEOS[@]} ]]; then
         SELECTED_VIDEO="${VIDEOS[$((vid_choice-1))]}"
         echo -e "\n${CYAN}🚀 Seçilen video işleniyor: $(basename "$SELECTED_VIDEO")${NC}\n"
-        python src/main.py ${VLM_MODE_ARG} --video "$SELECTED_VIDEO"
+        if .venv/bin/python src/main.py ${VLM_MODE_ARG} --video "$SELECTED_VIDEO"; then
+            pipeline_ok=1
+        fi
     else
         echo -e "\n${RED}❌ Geçersiz seçim! İşlem iptal edildi.${NC}"
         read -p "Ana menüye dönmek için Enter'a basın..."
         return
     fi
 
-    echo -e "\n${GREEN}✅ İŞLEM TAMAMLANDI! Çıktılar 'outputs' klasöründedir.${NC}\n"
-    open outputs/
+    if [[ "$pipeline_ok" -eq 1 ]]; then
+        echo -e "\n${GREEN}✅ İŞLEM TAMAMLANDI! Çıktılar 'outputs' klasöründedir.${NC}\n"
+        open outputs/
+    else
+        echo -e "\n${RED}❌ İşlem başarısız oldu. Yukarıdaki hata mesajını kontrol edin.${NC}\n"
+    fi
     read -p "Ana menüye dönmek için Enter'a basın..."
 }
 

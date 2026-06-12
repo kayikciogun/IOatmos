@@ -7,6 +7,8 @@ import urllib.request
 import base64
 import asyncio
 import aiohttp
+import warnings
+from PIL import Image
 from pathlib import Path
 
 # .env dosyasını yükle
@@ -22,7 +24,7 @@ except ImportError:
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip().strip('"').strip("'")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "grok-4.1-fast"
+MODEL = "qwen/qwen3.7-plus"
 
 # ============================================================
 #   Local (llama.cpp Server) Ayarları
@@ -35,20 +37,63 @@ LLAMA_SERVER_URL = f"http://127.0.0.1:{LLAMA_SERVER_PORT}"
 #   Prompt
 # ============================================================
 
-SIMPLE_DESIGNER_PROMPT = """You are a sound designer watching ONE frame.
-For this scene, provide 3 DIFFERENT ambience descriptions, each must include day/night/time.
+SIMPLE_DESIGNER_PROMPT = """You are tagging a shot for a professional sound-effects library.
 
-Return ONLY a JSON object with 3 fields, no explanation:
+The image is only a clue. Output THREE DIFFERENT search queries — each targeting distinct audible layers for the same scene. No visual description.
+
+Return ONLY valid JSON, no markdown:
 
 {
-  "base": "broad environment ambience with time (e.g. 'busy city street at noon ambience')",
-  "near": "specific location ambience with time (e.g. 'quiet office interior daytime room tone')",
-  "distant": "background texture ambience with atmosphere (e.g. 'distant traffic night echo urban')"
+  "bed": "...",
+  "near": "...",
+  "far": "..."
 }
 
-All 3 fields MUST describe ambience sounds (no foley, no dialogue, no specific actions).
-Each MUST include: day or night.
-Keep each query 4-10 words.
+- "bed": the base ambience bed (room tone, street ambience, forest atmo — the constant background layer).
+- "near": mid-field audible sources (footsteps, walla, machinery, water, birds, ventilation, construction activity).
+- "far": distant texture layer (traffic rumble, city drone, wind, industrial hum, thunder, ocean surf).
+
+Each field is a comma-separated keyword query, lowercase, like real library filenames.
+Make all three queries DIFFERENT from each other — near and far should NOT repeat the same keywords as bed.
+
+USE THIS VOCABULARY:
+
+Time: day, night, dawn, dusk
+Space: interior, exterior, int, ext
+Bed: ambience, atmosphere, atmo, room tone, roomtone, environment
+Place: urban, city, suburban, rural, industrial, office, restaurant, hospital, airport, alley, street, park, forest, beach, warehouse, laboratory
+Distance: distant, far, close, nearby, background, bg
+Dynamics: active, busy, quiet, calm, sparse, heavy, light, medium
+Traffic: traffic, city traffic, highway, motorway, vehicles passing, traffic rumble, traffic drone
+Mechanical: HVAC, air conditioning, ventilation, refrigerator, computer fan, machinery, construction, industrial hum, generator
+Nature: wind, breeze, gust, rain, thunder, stream, river, ocean, waterfall
+Life: birds, chirping, insects, wildlife, crowd, walla, voices, chatter, footsteps, movement
+Texture: rumble, hum, drone, hiss, buzz, rustle, splash, drip, echo, reverb
+
+Good examples:
+{
+  "bed": "day, exterior, urban, street ambience",
+  "near": "footsteps passing, walla crowd, bicycle pass by",
+  "far": "city traffic distant, wind light, birds chirping"
+}
+{
+  "bed": "night, interior, room tone, ventilation hum",
+  "near": "computer fan, keyboard typing, chair movement, footsteps",
+  "far": "traffic muffled distant, city drone, siren faint"
+}
+{
+  "bed": "day, exterior, forest, ambience, wind in trees",
+  "near": "stream water, birds chirping, rustle leaves",
+  "far": "thunder distant, rain light, traffic bg"
+}
+
+Rules:
+- bed: always time + int/ext + place + room tone/ambience (4-6 tags).
+- near: 3-5 audible foreground elements (humans, animals, moving things).
+- far: 2-4 distant/bg texture sources.
+- No dialogue, music, or sharp one-shots (gunshot, door slam, car horn).
+- 10-18 words per field; lowercase; standard library compound terms.
+- If unsure, pick generic ambience elements for that location.
 """
 
 # ============================================================
@@ -56,65 +101,52 @@ Keep each query 4-10 words.
 # ============================================================
 
 def _empty_response():
-    return {"layers": []}
+    return {"queries": [], "description": ""}
 
 def _parse_json_response(raw: str) -> dict:
-    """Parse JSON ambience layer response: {"base": "...", "near": "...", "distant": "..."}"""
+    """Parse JSON: {"bed": "...", "near": "...", "far": "..."} or {"description": "..."}"""
     try:
         obj_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not obj_match:
             return _empty_response()
         data = json.loads(obj_match.group())
 
-        # {"base": "...", "near": "...", "distant": "..."}
-        type_map = {"base": "background", "near": "foreground", "distant": "detail"}
-        if any(k in data for k in ("base", "near", "distant")):
-            layers = []
-            for key in ("base", "near", "distant"):
-                if key in data and data[key]:
-                    layers.append({
-                        "type": type_map.get(key, key),
-                        "query": str(data[key]).strip(),
-                    })
-            return {"layers": layers}
+        # New format: bed/near/far three-queries
+        queries = []
+        for key in ("bed", "near", "far"):
+            val = str(data.get(key, "")).strip()
+            if val:
+                queries.append(val)
+        if queries:
+            return {"queries": queries, "description": " | ".join(queries)}
+
+        # Legacy format: single description
+        for key in ("description", "sound_description", "query"):
+            if key in data and data[key]:
+                desc = str(data[key]).strip()
+                return {"queries": [desc], "description": desc}
     except Exception:
         pass
     return _empty_response()
 
 def parse_vlm_response(raw_text: str) -> dict:
-    """VLM yanıtını parse eder — sadece 3-layer array."""
+    """VLM yanıtını parse eder — multi-query veya tek description."""
     if not raw_text or not raw_text.strip():
         return _empty_response()
 
-    # Temizlik
     raw_text = re.sub(r'\[img-\d+\]', '', raw_text)
     raw_text = re.sub(r'<思考>.*?</思考>', '', raw_text, flags=re.DOTALL)
     raw_text = re.sub(r'<thinking>.*?</thinking>', '', raw_text, flags=re.DOTALL)
     raw_text = raw_text.replace('**', '').replace('*', '')
 
-    # 1. JSON array/object dene
     json_result = _parse_json_response(raw_text)
-    if json_result.get("layers"):
+    if json_result.get("queries"):
         return json_result
 
-    # 2. Fallback: A, B, C satır formatı
-    layers = []
-    for line in raw_text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-        if ':' in line:
-            parts = line.split(':', 1)
-            ltype = parts[0].strip().lower()
-            query = parts[1].strip()
-            if query and not ltype.startswith("here") and "layer" not in ltype.lower()[:2]:
-                layers.append({"type": ltype, "query": query})
+    if raw_text.strip():
+        return {"queries": [raw_text.strip()], "description": raw_text.strip()}
 
-    # Hiç bir şey yoksa tek satır → genel
-    if not layers and raw_text.strip():
-        layers = [{"type": "general", "query": raw_text.strip()}]
-
-    return {"layers": layers}
+    return _empty_response()
 
 # ============================================================
 #   Online (OpenRouter) Batch
@@ -135,7 +167,7 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
 
     payload = {
         "model": MODEL,
-        "reasoning": {"effort": "medium"},
+        "reasoning": {"effort": "high"},
         "messages": [{
             "role": "user",
             "content": [
@@ -143,7 +175,7 @@ async def _call_openrouter_async(session, image_path: str, retries: int = 3) -> 
                 {"type": "text", "text": SIMPLE_DESIGNER_PROMPT}
             ]
         }],
-        "temperature": 0.9,
+        "temperature": 0.7,
         "max_tokens": 1000,
         "response_format": {"type": "json_object"},
     }
@@ -194,10 +226,9 @@ async def _analyze_online_batch(scene_frame_paths: list[dict], max_workers: int 
         results = []
         for item, parsed in zip(scene_frame_paths, responses):
             results.append({**item, **parsed})
-            layers = parsed.get("layers", [])
-            if layers:
-                q_list = ", ".join([f"{l['type']}={l['query'][:500]}" for l in layers])
-                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
+            desc = parsed.get("description", "")
+            if desc:
+                print(f"   ✅ Scene {item['scene_id']:02d}: {desc[:80]}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
 
@@ -297,11 +328,9 @@ def _analyze_local_batch(scene_frame_paths: list[dict], base_model: str, mmproj:
         for item in scene_frame_paths:
             res = analyze_with_llamacpp_cli(item["frame_path"], base_model, mmproj)
             results.append({**item, **res})
-            desc = res.get("sound_description", "")
-            layers = res.get("layers", [])
-            if layers:
-                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
-                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
+            desc = res.get("description", "")
+            if desc:
+                print(f"   ✅ Scene {item['scene_id']:02d}: {desc[:80]}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
         return results
@@ -311,10 +340,9 @@ def _analyze_local_batch(scene_frame_paths: list[dict], base_model: str, mmproj:
         for item in scene_frame_paths:
             res = query_llama_server(item["frame_path"])
             results.append({**item, **res})
-            layers = res.get("layers", [])
-            if layers:
-                q_list = ", ".join([f"{l['type']}={l['query'][:25]}" for l in layers])
-                print(f"   ✅ Scene {item['scene_id']:02d} Layers: {q_list}")
+            desc = res.get("description", "")
+            if desc:
+                print(f"   ✅ Scene {item['scene_id']:02d}: {desc[:80]}")
             else:
                 print(f"   ⚠️ Scene {item['scene_id']:02d} BOŞ YANIT")
         return results

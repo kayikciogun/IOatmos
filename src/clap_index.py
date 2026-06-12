@@ -35,11 +35,20 @@ def _patched_load(*args, **kwargs):
     return _original_load(*args, **kwargs)
 torch.load = _patched_load
 
+import urllib.request
+
 import laion_clap
 import numpy as np
 import soundfile as sf
 import librosa
 from torch.utils.data import Dataset, DataLoader
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aiff", ".aif")
 
 # model_id mapping (laion_clap/hook.py):
@@ -91,21 +100,33 @@ def find_audio_files(audio_dir: str) -> list[str]:
     return sorted(set(os.path.abspath(f) for f in files))
 
 
-def get_audio_duration(file_path):
-    """Ses dosyasının süresini saniye cinsinden döndürür. Önce soundfile, sonra FFprobe kullanır."""
+def _duration_ffprobe(file_path: str) -> float | None:
+    """ffprobe ile süre okur — soundfile başarısız olursa yedek."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def get_audio_duration(file_path: str) -> float | None:
+    """Ses dosyasının süresini saniye cinsinden döndürür. Önce soundfile, sonra ffprobe."""
     try:
         info = sf.info(file_path)
         return info.frames / info.samplerate
     except Exception:
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", file_path],
-                capture_output=True, text=True, timeout=5
-            )
-            return float(result.stdout.strip())
-        except Exception:
-            return None
+        return _duration_ffprobe(file_path)
+
+
+def _duration_for_filter(file_path: str) -> tuple[str, float | None]:
+    """ProcessPool worker — libsndfile process başına izole, thread-safe crash yok."""
+    return file_path, get_audio_duration(file_path)
 
 
 # UCS_HINTS kaldırıldı, caption_enrichment.py tarafından yönetiliyor.
@@ -301,15 +322,17 @@ def main():
     # === Filtreleme (Minimum Süre) ===
     if args.min_duration > 0:
         from tqdm import tqdm
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor
         print(f"🔍 {args.min_duration} saniyeden kısa sesler ayıklanıyor...")
         
         filtered = []
         skipped_count = 0
-        
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        workers = min(8, os.cpu_count() or 4)
+
+        # libsndfile thread-safe değil; ProcessPool ile process başına izole okuma
+        with ProcessPoolExecutor(max_workers=workers) as ex:
             results = list(tqdm(
-                ex.map(lambda f: (f, get_audio_duration(f)), audio_files),
+                ex.map(_duration_for_filter, audio_files, chunksize=128),
                 total=len(audio_files), desc="Süre kontrolü"
             ))
             
@@ -477,9 +500,12 @@ def main():
         all_cap_lengths.append(-1)
     all_cap_lengths = all_cap_lengths[:len(all_paths)]
 
+    all_captions = [filename_to_caption(p) for p in all_paths]
+
     save_data = {
         "paths": np.array(all_paths),
         "embeddings": audio_arr,
+        "captions": np.array(all_captions, dtype=object),
         "preset": args.preset,
         "durations": np.array(all_durations, dtype=np.float32),
         "caption_lengths": np.array(all_cap_lengths, dtype=np.int16),

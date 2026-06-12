@@ -14,6 +14,12 @@ import sys
 import re
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import torch
 _original_load = torch.load
 def _patched_load(*args, **kwargs):
@@ -27,6 +33,11 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from clap_index import PRESETS, download_ckpt_if_needed
 
+# Benchmark: test1_sound_analysis.json (27 layer, 76k index) — 2025-06
+# text-only + BM25 en iyi; audio embedding metin sorgularında zayıf kalıyor.
+DEFAULT_TEXT_WEIGHT = 0.55
+DEFAULT_BM25_BOOST_WEIGHT = 0.4
+
 
 def load_index(path: str):
     if not os.path.exists(path):
@@ -36,10 +47,13 @@ def load_index(path: str):
     bm25 = None
     captions = None
     if "captions" in data.files:
-        from rank_bm25 import BM25Okapi
         captions = data["captions"].tolist()
-        tokenized = [cap.lower().split() for cap in captions]
-        bm25 = BM25Okapi(tokenized)
+        try:
+            from rank_bm25 import BM25Okapi
+            tokenized = [cap.lower().split() for cap in captions]
+            bm25 = BM25Okapi(tokenized)
+        except ImportError:
+            print("   ℹ️ rank_bm25 yok — BM25 re-ranking atlandı (pip install rank-bm25)")
 
     return {
         "paths":       data["paths"].tolist(),
@@ -99,21 +113,27 @@ def preprocess_query(query: str, layer_type: str = None) -> str:
     # Küçült
     q = query.lower().strip()
 
-    # Layer-aware düzeltmeler
-    if layer_type == "background":
-        # Background: genel ambience odaklı, spesifik locasyon detaylarını azalt
-        # "cozy tiny home kitchen morning room tone" → "home kitchen ambience morning"
-        pass
-    elif layer_type == "foreground":
-        # Foreground: orta mesafe, interior/exterior önemli
-        pass
+    # Layer-aware: mesafe kelimelerini katmana göre ayarla
+    if layer_type == "foreground":
+        for phrase in ("distant ", "far-off ", "far off ", "faint distant "):
+            q = q.replace(phrase, "")
     elif layer_type == "detail":
-        # Detail: distant/echo/reverb önemli
-        pass
+        distance_markers = (
+            "distant", "far ", "far-", "background", "outside",
+            "rumble", "drone", "echo", "murmur",
+        )
+        if not any(m in q for m in distance_markers):
+            q = "distant " + q
+    elif layer_type == "background":
+        for phrase in ("close ", "close-up ", "nearby ", "up close "):
+            q = q.replace(phrase, "")
 
     # Remove words that are too specific/visual and don't help audio search
-    visual_words = {"sunlit", "sunny", "bright", "dark", "shadow", "colorful",
-                    "beautiful", "picturesque", "scenic", "glistening", "golden"}
+    visual_words = {
+        "sunlit", "sunny", "bright", "dark", "shadow", "colorful",
+        "beautiful", "picturesque", "scenic", "glistening", "golden",
+        "lush", "sterile", "cozy",
+    }
     tokens = q.split()
     filtered = [t for t in tokens if t not in visual_words]
     q = " ".join(filtered)
@@ -134,10 +154,13 @@ def search_clap_cosine(
     query: str,
     idx: dict,
     model,
-    text_weight: float = 0.75,
+    text_weight: float = DEFAULT_TEXT_WEIGHT,
     min_score: float | None = None,
+    negative_queries: list[str] | None = None,
+    negative_weight: float = 0.40,
 ) -> list[dict]:
     """Tek bir query string için CLAP cosine + optional text hybrid arama.
+    Negatif query desteği: istenmeyen sesleri penalize eder.
     Döndürür: [{path, score, raw_sim, audio_sim, text_sim}, ...]
     score: raw cosine * 100, gerçek eşleşmeyi yansıtır.
     """
@@ -158,6 +181,16 @@ def search_clap_cosine(
         hybrid = (1 - text_weight) * sim_audio + text_weight * sim_text
     else:
         hybrid = sim_audio
+
+    # Negative penalty: istenmeyen query'lere benzeyen sesleri düşür
+    if negative_queries:
+        neg_emb = model.get_text_embedding(negative_queries, use_tensor=False)
+        neg_emb = neg_emb / np.linalg.norm(neg_emb, axis=1, keepdims=True)
+        # (num_neg, embed) @ (embed, N) → (num_neg, N)
+        neg_sim = (neg_emb @ idx["audio"].T)
+        # Her aday için en kötü (en yüksek) negative benzerliği al
+        max_neg_sim = neg_sim.max(axis=0)
+        hybrid = hybrid - negative_weight * max_neg_sim
 
     # Scale to 0-100
     scaled = _scale_to_100(hybrid)
@@ -245,22 +278,23 @@ def _bm25_boost(
 def smart_search(
     query,
     idx: dict,
-    model,
+    model=None,
     top_k: int = 3,
-    text_weight: float = 1.0,
+    text_weight: float = DEFAULT_TEXT_WEIGHT,
     min_score: float | None = None,
     layer_type: str | None = None,
-    bm25_boost_weight: float = 0.25,
+    bm25_boost_weight: float = DEFAULT_BM25_BOOST_WEIGHT,
     use_bm25: bool = True,
+    negative_queries: list[str] | None = None,
+    negative_weight: float = 0.40,
 ) -> dict:
-    """Akıllı hibrit arama: CLAP + BM25 + layer-aware optimizasyon.
+    """Akıllı hibrit arama: CLAP cosine + BM25.
 
     - query: str veya list[str]
-    - Eğer liste ise: her query ayrı aranır, sonuçlar merge edilir.
     - layer_type: "background" | "foreground" | "detail" → query ön işleme
-    - bm25_boost_weight: 0.0 = BM25 yok, 0.25 = %25 BM25 boost (önerilen)
-    - use_bm25: BM25 ile boost et (index'te varsa)
     """
+    if model is None:
+        raise ValueError("CLAP arama için model gerekli")
     if isinstance(query, str):
         queries = [query]
     elif isinstance(query, list):
@@ -282,13 +316,16 @@ def smart_search(
             idx=idx,
             model=model,
             text_weight=text_weight,
+            negative_queries=negative_queries,
+            negative_weight=negative_weight,
         )
 
-        # Optional BM25 boost (only on top candidates)
         if use_bm25 and idx["bm25"] is not None:
             results = _bm25_boost(q, idx, results, boost_weight=bm25_boost_weight, top_n=100)
 
         per_query[q] = results
+
+    source_tag = "clap_bm25" if use_bm25 and idx["bm25"] else "clap"
 
     # Tek query → direkt döndür
     if len(processed) == 1:
@@ -299,7 +336,7 @@ def smart_search(
         best = candidates[0]["score"] if candidates else 0
         return {
             "results": candidates,
-            "source": "hybrid" if (use_bm25 and idx["bm25"]) else "cosine",
+            "source": source_tag,
             "confidence": _score_to_confidence(best),
             "best_score": best,
         }
@@ -324,7 +361,7 @@ def smart_search(
 
     return {
         "results": candidates,
-        "source": "hybrid_multi" if (use_bm25 and idx["bm25"]) else "cosine_multi",
+        "source": f"{source_tag}_multi",
         "confidence": _score_to_confidence(best),
         "best_score": best,
         "num_queries": len(queries),

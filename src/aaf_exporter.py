@@ -110,7 +110,7 @@ def create_external_aaf(manifest_path, output_aaf_path=None, verbose=False):
     project_name = data.get("project_name", "sound_design")
     scenes = data.get("scenes", [])
     fps, _, _ = _resolve_rate(data.get("video_fps", 30.0))  # timeline edit rate
-    LAYER_NAMES = ["Ambience", "Support", "Spot FX"]
+    LAYER_NAMES = ["Ch1", "Ch2", "Ch3"]
     num_alternatives = 3  # Fixed 3-layer system
 
     # Toplam süreyi hesapla (Timecode track uzunluğu için)
@@ -401,7 +401,7 @@ def create_embedded_aaf(manifest_path, output_aaf_path=None, verbose=False, max_
     project_name = data.get("project_name", "sound_design")
     scenes = data.get("scenes", [])
     fps, _, _ = _resolve_rate(data.get("video_fps", 30.0))
-    LAYER_NAMES = ["Ambience", "Support", "Spot FX"]
+    LAYER_NAMES = ["Ch1", "Ch2", "Ch3"]
     num_alternatives = 3
 
     # Toplam süreyi hesapla (timecode track uzunluğu için)

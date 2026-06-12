@@ -22,7 +22,13 @@ scikit-learn
 pandas>=2.2.0
 llvmlite
 
+# Arama
+rank-bm25
+
 # Veri / yardımcı
+aiohttp
+python-dotenv
+Pillow
 h5py
 tqdm
 regex

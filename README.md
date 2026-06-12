@@ -9,11 +9,11 @@ Bu sistem bir videoyu alır, sahnelere ayırır, yapay zeka ile her sahneyi anal
 ## 🧠 Nasıl Çalışır?
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────┐     ┌─────────┐
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────┐     ┌──────────────┐     ┌─────────┐
 │  Video       │────▶│ Sahne Tespit │────▶│  VLM Analiz  │────▶│ CLAP     │────▶│  AAF    │
 │  (inputs/)   │     │ (SceneDet.)  │     │ (OpenRouter  │     │ Eşleştir │     │ Export  │
 └─────────────┘     └──────────────┘     │  API)        │     └──────────┘     └─────────┘
-                          │                      │                   │               │
+                          │                      │                   │                    │
                      scenes.json          sound_analysis.json   manifest.json   sound_design.aaf
 ```
 
@@ -23,10 +23,10 @@ Bu sistem bir videoyu alır, sahnelere ayırır, yapay zeka ile her sahneyi anal
 |------|-----------|-----------|
 | 1 | Videoyu sahnelere ayırır | PySceneDetect (AdaptiveDetector) |
 | 2 | Her sahnenin ortasından kare çıkarır | OpenCV |
-| 3 | Her kareyi analiz edip ses ortamını tanımlar | OpenRouter API (grok-4.1-fast) |
-| 4 | Tanımlamaları ses kütüphanesinde arar | CLAP (text→audio similarity) |
+| 3 | Her kareyi analiz edip 3-layer ses ortamı tanımlar | OpenRouter API (grok-4.1-fast) veya local llama.cpp |
+| 4 | Tanımlamaları ses kütüphanesinde arar | Online: Gemini Embedding + BM25; Offline: CLAP + BM25 |
 | 5 | Manifest JSON oluşturur | Python |
-| 6 | DAW'a import edilebilir AAF dosyası oluşturur | pyaaf2 |
+| 6 | Sesleri 48kHz'e çevirip AAF dosyası oluşturur | pyaaf2 + FFmpeg |
 
 ---
 
@@ -62,9 +62,9 @@ IOatmos, Apple Silicon (M-Serisi) çiplerin gücünü sonuna kadar kullanmak üz
 - **Akıllı Temizlik:** Dosya isimlerindeki anlamsız kütüphane kodlarını (`3DS02`, `QP92` vb.) otomatik temizler, sadece anlamlı kelimeleri (Caption) kullanarak daha doğru eşleşme yapar.
 - **MPS (GPU) Desteği:** Ses indeksleme ve CLAP eşleştirme Apple GPU (Metal Performance Shaders) üzerinde koşar.
 - **Güvenli Okuma:** Çok uzun ses dosyalarında bile donma/çökme yaşanmaması için 120 saniyelik akıllı okuma limiti mevcuttur.
-- **Sabit Hibrit Skorlama:** CLAP aramada text ağırlığı sabit %65, audio ağırlığı %35 olarak kalibre edilmiştir. Dosya adı/caption metinleri ile LLM description arasındaki eşleşmeyi önceliklendirir.
-- **Saf CLAP Eşleştirme:** Kategori filtreleme veya re-rank bonus olmadan, doğrudan CLAP embedding benzerliği ile arama yapılır. Sadece text/audio hibrit skor belirleyicidir.
-- **Dosya Adı Temizleme:** Ses dosyası isimlerindeki anlamsız kütüphane kodlarını (`3DS02`, `QP92` vb.) otomatik temizleyerek CLAP caption'larını optimize eder.
+- **Çift arama backend:** Kurulumda index hem CLAP hem Gemini caption embedding üretir. CLI'da Online → Gemini arama (model yüklenmez); Local → CLAP arama (offline).
+- **Hibrit Skorlama:** CLAP `text_weight=0.5` (%50 audio + %50 text) + BM25 boost; Gemini modunda caption embedding cosine + BM25.
+- **Katmanlı Ses Tasarımı:** Her sahne için 3 ayrı layer (Background/Ambience, Foreground/Support, Detail/Spot FX) otomatik oluşturulur.
 
 ---
 
@@ -72,24 +72,25 @@ IOatmos, Apple Silicon (M-Serisi) çiplerin gücünü sonuna kadar kullanmak üz
 
 ```
 IOatmos/
-├── IOatmos.command           # 🚀 ANA MENÜ — Her şeyi buradan yapın
+├── IOatmos.command             # 🚀 ANA MENÜ — Her şeyi buradan yapın
 ├── src/
-│   ├── main.py               # 🎯 Ana pipeline — video'dan AAF'a
-│   ├── clap_index.py         # 🎵 Ses kütüphanesini CLAP ile indexle (zero-shot UCS classification)
-│   ├── clap_search.py        # 🔍 Hibrit arama (audio + text similarity, text_weight=0.65)
-│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (OpenRouter API)
-│   ├── vlm_processor.py      # 👁️ VLM ile sahne analizi (OpenRouter API)
-│   ├── aaf_exporter.py       # 🎛️ AAF dosyası oluşturucu (Logic/Pro Tools/DaVinci)
+│   ├── main.py                 # 🎯 Ana pipeline — video'dan AAF'a
+│   ├── clap_index.py           # 🎵 Ses kütüphanesini CLAP ile indexle
+│   ├── clap_search.py          # 🔍 Hibrit arama (audio + text similarity)
+│   ├── vlm_processor.py        # 👁️ VLM ile sahne analizi (OpenRouter / llama.cpp)
+│   ├── aaf_exporter.py         # 🎛️ AAF dosyası oluşturucu (48kHz embed)
 │   └── VtoF/
-│       └── video_analyzer.py # 🎬 Sahne tespiti ve kare çıkarma
-├── inputs/                   # 📥 Videolarınızı buraya koyun
-├── outputs/                  # 📤 Tüm çıktılar (AAF, manifest, frame'ler)
-├── models/                   # 💾 CLAP checkpoint dosyası (otomatik indirilir)
-├── sfx/                      # 🎶 Ses efekt kütüphaneniz
-├── Docs/                     # 📖 Dokümantasyon
-├── requirements.txt          # 📦 Python bağımlılıkları
-├── index.npz                 # 💾 CLAP ses index dosyası (otomatik oluşur)
-└── README.md                 # 📘 Bu dosya
+│       ├── video_analyzer.py   # 🎬 Sahne tespiti
+│       ├── frame_extractor.py  # 🖼️ Kare çıkarma
+│       └── scene_map_builder.py# 🗺️ Sahne haritası
+├── inputs/                     # 📥 Videolarınızı buraya koyun
+├── outputs/                    # 📤 Tüm çıktılar (AAF, manifest, frame'ler)
+├── models/                     # 💾 VLM + CLAP model dosyaları
+├── sfx/                        # 🎶 Ses efekt kütüphaneniz
+├── Docs/                       # 📖 Dokümantasyon
+├── requirements.txt            # 📦 Python bağımlılıkları
+├── index.npz                   # 💾 CLAP ses index dosyası (otomatik oluşur)
+└── README.md                   # 📘 Bu dosya
 ```
 
 ---
@@ -98,26 +99,42 @@ IOatmos/
 
 ### Logic Pro
 1. `File → Open` veya sürükle-bırak
-2. 3 audio track görünecek: **Ambience**, **Support**, **Spot FX**
+2. 3 audio track görünecek: **Ambience** (Track 1), **Support** (Track 2), **Spot FX** (Track 3)
 
 ### DaVinci Resolve
 1. `File → Import → AAF/EDL/XML`
-2. Medya yollarını doğrulayın (ses dosyaları orijinal konumlarında kalmalı)
+2. Medya AAF içine gömülüdür, harici dosya yolu gerekmez.
 
 ### Pro Tools
 1. `File → Import → Session Data` → AAF seçin
 
-> ⚠️ **Önemli**: AAF dosyası ses dosyalarını **gömer değil, referans verir** (external link). Ses dosyalarınızın orijinal konumlarında kalması gerekir.
+> ✅ **Not:** AAF dosyası ses dosyalarını **48kHz'e çevirip içine gömer** (embedded). Orijinal ses dosyalarının yerinde kalmasına gerek yoktur.
+
+---
+
+## ⚙️ Ortam Değişkenleri (Environment Variables)
+
+Aşağıdaki ayarları `.env` dosyasına veya shell ortamına ekleyebilirsiniz:
+
+| Değişken | Varsayılan | Açıklama |
+|----------|-----------|----------|
+| `OPENROUTER_API_KEY` | — | OpenRouter API anahtarı (VLM sahne analizi için zorunlu) |
+| `HF_HUB_DISABLE_TELEMETRY` | `1` | HuggingFace telemetrisini devre dışı bırakır |
+
+Örnek `.env`:
+```bash
+OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxx
+```
 
 ---
 
 ## ❓ Sık Sorulan Sorular
 
 **S: İnternet gerekli mi?**
-H: VLM sahne analizi (Adım 3) için internet bağlantısı ve OpenRouter API anahtarı gereklidir. Ses eşleştirme tamamen yerel CLAP ile yapılır, offline çalışır.
+H: VLM sahne analizi (Adım 3) için internet bağlantısı ve OpenRouter API anahtarı gereklidir. Ses eşleştirme (CLAP) tamamen yereldir, offline çalışır.
 
 **S: Ne kadar sürer?**
-M1 MacBook'ta: Sahne analizi ~5-10sn/sahne (API bağlantı hızına bağlı), ses eşleştirme ~1-2sn/sahne.
+M1 MacBook'ta: Sahne analizi ~5-10sn/sahne (API bağlantı hızına bağlı), ses eşleştirme ~20-40ms/layer.
 
 **S: Hangi video formatları desteklenir?**
 MP4, MOV, AVI, MKV.
@@ -129,7 +146,7 @@ WAV, MP3, AIFF, FLAC, OGG, M4A — hepsi desteklenir.
 Kütüphanenize yeni dosyalar eklediğinizde `--update` ile hızlıca güncelleyin. Sadece yeni dosyalar embed edilir, mevcut index korunur.
 
 **S: CLAP aramada text/audio oranı nedir?**
-Sabit `text_weight=0.65` kullanılır. Yani %65 text (caption/description) benzerliği, %35 audio spektrogram benzerliği. Bu, LLM'in çıkardığı "waves crashing surf roar" gibi metnin, ses dosyasının zenginleştirilmiş caption'ıyla eşleşmesini önceliklendirir.
+Varsayılan `text_weight=0.5`. Yani %50 audio + %50 text (caption/description) hibrit skor. `clap_search.py` içinden ayarlanabilir.
 
 ---
 
